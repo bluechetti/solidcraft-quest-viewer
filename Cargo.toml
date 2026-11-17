@@ -1,0 +1,82 @@
+[package]
+name = "scview"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+openxr = { version = "0.19", features = ["loaded"] }
+ash = "0.38"
+android-activity = { version = "0.6", features = ["native-activity"] }
+log = "0.4"
+android_logger = "0.14"
+jni-sys = "0.3"
+
+[profile.release]
+opt-level = 3
+
+[package.metadata.android]
+package = "org.scview.viewer"
+build_targets = ["aarch64-linux-android"]
+runtime_libs = "lib"
+apk_label = "SC View"
+
+[package.metadata.android.sdk]
+min_sdk_version = 29
+target_sdk_version = 32
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vr.headtracking"
+required = true
+version = 1
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+# Push-to-talk: the app asks for the microphone itself the first time it starts.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+# Room scan and depth (the raycast that finds tables and floors); the app asks for it at start.
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_SCENE"
+
+[[package.metadata.android.uses_feature]]
+name = "com.oculus.feature.PASSTHROUGH"
+required = false
+
+# No Guardian boundary for this app: it always shows the room (passthrough cannot be switched off).
+[[package.metadata.android.uses_feature]]
+name = "com.oculus.feature.BOUNDARYLESS_APP"
+required = true
+
+[package.metadata.android.application]
+debuggable = true
+theme = "@android:style/Theme.Black.NoTitleBar.Fullscreen"
+
+[[package.metadata.android.application.meta_data]]
+name = "com.oculus.supportedDevices"
+value = "quest3|quest3s|quest2|questpro"
+
+[package.metadata.android.application.activity]
+config_changes = "density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+resizeable_activity = false
+launch_mode = "singleTask"
+orientation = "landscape"
+exported = true
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["com.oculus.intent.category.VR", "android.intent.category.LAUNCHER", "org.khronos.openxr.intent.category.IMMERSIVE_HMD"]
+
+[package.metadata.android.signing.release]
+path = "test.keystore"
+keystore_password = "scviewtest"
+
+[[package.metadata.android.application.meta_data]]
+name = "com.oculus.vr.focusaware"
+value = "true"

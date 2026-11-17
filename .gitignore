@@ -1,0 +1,5 @@
+target/
+.cargo_home/
+__pycache__/
+*.keystore
+.claude/settings.local.json
