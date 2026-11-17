@@ -234,9 +234,16 @@ def design_summary(focus=()):
 
 
 def api_key():
-    r = subprocess.run(["security", "find-generic-password", "-s", "scview-anthropic", "-w"], capture_output=True,
-                       text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
+    """The Anthropic API key: the macOS Keychain, else the Linux keyring (secret-tool, service scview-anthropic),
+    else ANTHROPIC_API_KEY."""
+    for cmd in (["security", "find-generic-password", "-s", "scview-anthropic", "-w"],
+                ["secret-tool", "lookup", "service", "scview-anthropic"]):
+        if not shutil.which(cmd[0]):
+            continue
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return os.environ.get("ANTHROPIC_API_KEY") or None
 
 
 def claude(key, body):
@@ -701,7 +708,8 @@ def ask(request_text, selected=(), pointed=None, faces=(), allow_confirm=True, e
     past --context-confirm the request waits (pending["st"] is set) for /ask/confirm; past --context-max it stops."""
     key = api_key()
     if not key:
-        return "No API key: run  security add-generic-password -a \"$USER\" -s scview-anthropic -w  on the Mac.", False
+        return ("No API key: run  security add-generic-password -a \"$USER\" -s scview-anthropic -w  on a Mac, or "
+                "secret-tool store --label scview service scview-anthropic  on Linux."), False
     tools = [{"name": n, "description": session.tools[n].get("description", "")[:1500],
               "input_schema": session.tools[n].get("inputSchema", {"type": "object"})} for n in AI_TOOLS
              if n in session.tools]
