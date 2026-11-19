@@ -2716,6 +2716,8 @@ fn run(app: &Host) {
         // Holding the model: SolidCraft's own world grab (svr::grab), so it handles here as in the desktop
         // app's VR mode. One grip carries it, both grips scale it about the point between the hands, and
         // a scale brought near real size snaps to it.
+        let debug_ray = std::env::var_os("SCVIEW_DEBUG_RAY").is_some();
+        let mut debug_ray_n = 0u32;
         let mut grab = svr::grab::WorldGrab::default();
         let mut at_real_size = false;
         // Once the model has been handled it stays where it was put (no more auto-turning).
@@ -3355,6 +3357,14 @@ fn run(app: &Host) {
                             if d[2] < -1e-4 {
                                 let t = -o[2] / d[2];
                                 let (x, y) = (o[0] + t * d[0], o[1] + t * d[1]);
+                                // For tests without a headset (SCVIEW_DEBUG_RAY=1): where the pointer's ray meets the
+                                // panel's plane, so a script can steer a simulated controller onto a button.
+                                if debug_ray {
+                                    debug_ray_n = debug_ray_n.wrapping_add(1);
+                                    if debug_ray_n % 6 == 0 {
+                                        log::info!("PANELRAY x {x:.4} y {y:.4} t {t:.3} h {:.4} row {:?}", lay.h, overlay_row_at(overlay, y, ov_rows, lay.h));
+                                    }
+                                }
                                 if t > 0.0 && x.abs() <= PANEL_W / 2.0 && y.abs() <= lay.h / 2.0 {
                                     on_panel = true;
                                     hover_btn = panel::button_at(&lay, x, y);
