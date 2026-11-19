@@ -309,6 +309,8 @@ def design_summary(focus=()):
             hidden = d.get("visibility", {}).get("hidden_bodies") if isinstance(d.get("visibility"), dict) else None
             if hidden:
                 parts.append(f"Hidden bodies: {hidden}")
+        if state.get("hidden"):
+            parts.append(f"Hidden in the headset (the wearer cannot see these now): {state['hidden']}")
     except (RuntimeError, ValueError) as e:
         parts.append(f"(summary unavailable: {e})")
     return "\n".join(parts)
@@ -777,9 +779,21 @@ topology_cache = {}  # (model version, body) -> body_topology faces
 
 
 def resolve_face(body_name, p, n):
+    """The face the headset's surface point lies on (see resolve_face_item), as a short description for the AI."""
+    f = resolve_face_item(body_name, p, n)
+    if f is None:
+        return None
+    kind = ("flat, normal " + json.dumps([round(x, 3) for x in f["plane_normal"]]) if f.get("plane_normal") else
+            f"cylindrical, radius {f['cylinder']['radius']:.3g} mm, axis {json.dumps([round(x, 3) for x in f['cylinder']['axis']])}"
+            if f.get("cylinder") else "curved")
+    return (f'face "{f["name"]}" (index {f["index"]}) of "{body_name}": {kind}, area {f["area"]:.3g} mm2, '
+            f'a point on it {json.dumps([round(x, 3) for x in f["point"]])}')
+
+
+def resolve_face_item(body_name, p, n):
     """The SolidCraft face of `body_name` that the headset's surface point p (with surface normal n, either
     way round) lies on: flat faces by distance to their plane, cylinders by distance to the surface, other
-    faces by distance to their reference point. Returns a short description for the AI, or None."""
+    faces by distance to their reference point. Returns the face as body_topology gives it, or None."""
     key = (state["version"], body_name)
     if key not in topology_cache:
         text, err = session.call("body_topology", {"body": body_name})
@@ -809,12 +823,48 @@ def resolve_face(body_name, p, n):
             best = (err, f)
     if best is None or best[0] > 1.0:
         return None
-    f = best[1]
-    kind = ("flat, normal " + json.dumps([round(x, 3) for x in f["plane_normal"]]) if f.get("plane_normal") else
-            f"cylindrical, radius {f['cylinder']['radius']:.3g} mm, axis {json.dumps([round(x, 3) for x in f['cylinder']['axis']])}"
-            if f.get("cylinder") else "curved")
-    return (f'face "{f["name"]}" (index {f["index"]}) of "{body_name}": {kind}, area {f["area"]:.3g} mm2, '
-            f'a point on it {json.dumps([round(x, 3) for x in f["point"]])}')
+    return best[1]
+
+
+# --- requests the server answers itself from what is selected: an exact measure, and selecting by name ---
+
+MEASURE_WORDS = {"measure", "measure these", "measure this", "measure the distance", "distance", "the distance", "how far apart",
+                 "how far apart are these", "how far apart are they", "what is the distance", "what is the angle", "angle"}
+
+
+def measure_faces(items):
+    """The exact distance and angle between two picked faces, from SolidCraft's own measure: one sentence."""
+    text, err = session.call("execute", {"command": "inspect.measure", "params": {"items": items}})
+    if err:
+        return f"SolidCraft could not measure those: {text[:120]}"
+    m = json.loads(text)
+    dist, angle = m.get("distance_mm"), m.get("angle_deg")
+    if dist is None:
+        return "SolidCraft gave no distance for those two faces."
+    if angle is not None and min(abs(angle), abs(180 - abs(angle))) < 0.01:
+        return f"Parallel faces, {dist:.4g} mm apart."
+    return f"{dist:.4g} mm apart at the nearest, at {angle:.4g} degrees to each other." if angle is not None else f"{dist:.4g} mm apart."
+
+
+SELECT_RE = re.compile(r"^(?:select|pick|choose) (?:all |every |each )?(?:of )?(?:the )?(.+?)$")
+
+
+def select_by_words(word):
+    """The bodies a request like "select the posts" names, or None when it is no such request (or names
+    nothing, and the AI may know better). "select all" and "select everything" are every body."""
+    m = SELECT_RE.match(word)
+    if not m:
+        return None
+    what = m.group(1).strip()
+    names = all_body_names()
+    if what in ("all", "everything", "parts", "bodies", "all parts", "all bodies"):
+        return names
+    low = {n.lower(): n for n in names}
+    if what in low:
+        return [low[what]]
+    stems = {what.replace(" ", ""), what.replace(" ", "_")} | ({what[:-1].replace(" ", "")} if what.endswith("s") else set())
+    hits = [n for n in names if any(n.lower().startswith(stem) for stem in stems if stem)]
+    return hits or None
 
 
 edge_topo_cache = {}  # (model version, body) -> body_topology edges
@@ -1234,7 +1284,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
-                             "/preview/apply", "/preview/cancel"):
+                             "/preview/apply", "/preview/cancel", "/visibility"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1369,6 +1419,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        if self.path == "/visibility":
+            # What the wearer has hidden, as a JSON list of body names in X-Hidden. Kept for the AI's summary;
+            # with --sync-visibility SolidCraft's own browser is set to match (that is an undo step there).
+            try:
+                names = json.loads(urllib.parse.unquote(self.headers.get("X-Hidden", "") or "[]"))
+                names = [str(n) for n in names][:2000] if isinstance(names, list) else []
+            except ValueError:
+                names = []
+            with lock:
+                state["hidden"] = names
+            if args.sync_visibility and session is not None:
+                try:
+                    session.call("execute", {"command": "browser.visibility", "params": {"visible": True, "folder": "bodies"}})
+                    if names:
+                        session.call("execute", {"command": "browser.visibility", "params": {"visible": False, "items": names}})
+                except RuntimeError as e:
+                    log(f"visibility: {e}")
+            log(f"hidden in the headset: {names}")
+            self.reply_json({"heard": "", "reply": "", "ok": True, "changed": False})
+            return
         if self.path in ("/preview/apply", "/preview/cancel"):
             # The change on show: make it, or drop it.
             reply, changed = "", False
@@ -1485,7 +1555,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": heard, "reply": reply, "ok": ok, "changed": False, "id": note_id or ""})
             return
         t = time.time()
-        heard, reply, ok, changed, command, previewing = "", "", False, False, None, False
+        heard, reply, ok, changed, command, previewing, select = "", "", False, False, None, False, None
         # The headset sends the selected bodies' names as percent-encoded JSON.
         try:
             selected = json.loads(urllib.parse.unquote(self.headers.get("X-Selected", "") or "[]"))
@@ -1504,11 +1574,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (ValueError, RuntimeError):
             pointed = None
         # Selected faces: one per line, "body\tx\ty\tz\tnx\tny\tnz" (a point on the face and the normal there).
-        faces = []
+        faces, face_items = [], []
         try:
             for line in urllib.parse.unquote(self.headers.get("X-Faces", "")).split("\n")[:50]:
                 f = line.split("\t")
                 if len(f) == 7 and session:
+                    item = resolve_face_item(f[0], [float(v) for v in f[1:4]], [float(v) for v in f[4:7]])
+                    if item is not None:
+                        face_items.append({"type": "face", "body": f[0], "index": item["index"]})
                     d = resolve_face(f[0], [float(v) for v in f[1:4]], [float(v) for v in f[4:7]])
                     faces.append(d or f"a face of \"{f[0]}\" through the point {[round(float(v), 3) for v in f[1:4]]} (not matched exactly)")
         except (ValueError, RuntimeError):
@@ -1551,7 +1624,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     log(f"spoken drop: {dropped}")
                     self.reply_json({"heard": heard, "reply": dropped, "ok": True, "changed": False})
                     return
-            if pending["st"] is not None and word in GO_WORDS:
+            picked = None if (args.no_direct or word in COMMAND_PHRASES) else select_by_words(word)
+            if word in MEASURE_WORDS and len(face_items) == 2 and not args.no_direct:
+                # Two faces picked and a request to measure: SolidCraft's exact answer, no AI.
+                reply, ok = measure_faces(face_items), True
+                log(f"measured two picked faces: {reply}")
+            elif picked:
+                select = picked
+                reply, ok = (f"Selected {picked[0]}." if len(picked) == 1 else f"Selected {len(picked)} parts: {', '.join(picked)[:80]}."), True
+                log(f"selected by name: {picked}")
+            elif pending["st"] is not None and word in GO_WORDS:
                 log("spoken OK to the waiting big request")
                 reply, changed, ok = resume_pending()
             elif pending["st"] is not None and (word in STOP_WORDS or CANCEL_END.search(heard)):
@@ -1611,6 +1693,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out["cost"] = f"{spend.get('spent', 0.0) - spent_before:.4f}"
         if command:
             out["command"] = command
+        if select:
+            out["select"] = "\x1f".join(select)  # names for the viewer to select, unit-separated
         if ok and previewing:
             out["preview"] = True
         if confirm_k():
@@ -1855,6 +1939,8 @@ def main():
     ap.add_argument("--preview", choices=["off", "ai"], default=os.environ.get("SCVIEW_PREVIEW") or "ai",
                     help="ai (default): a change the AI makes is only shown, and made when the wearer applies it; "
                          "off: made at once, as before")
+    ap.add_argument("--sync-visibility", action="store_true",
+                    help="also hide in SolidCraft what the wearer hides in the headset (an undo step in SolidCraft each time)")
     ap.add_argument("--no-direct", action="store_true",
                     help="send every request to the AI, even one that only sets a parameter or dimension")
     ap.add_argument("--ai", choices=["anthropic", "ollama"], default=os.environ.get("SCVIEW_AI") or "anthropic",

@@ -2778,6 +2778,8 @@ fn run(app: &Host) {
         // a scale brought near real size snaps to it.
         let debug_ray = std::env::var_os("SCVIEW_DEBUG_RAY").is_some();
         let mut debug_ray_n = 0u32;
+        let mut debug_state_n = 0u32;
+        let mut hidden_sent: Vec<bool> = Vec::new();
         let mut grab = svr::grab::WorldGrab::default();
         let mut at_real_size = false;
         // Once the model has been handled it stays where it was put (no more auto-turning).
@@ -3655,6 +3657,18 @@ fn run(app: &Host) {
             }
             if key_btn.is_some() {
                 log::info!("key for button {key_btn:?}");
+            }
+            // Parts the server found for "select the posts": they become the selection.
+            if let Some(names) = voice::take_select() {
+                for (sel, b) in selected.iter_mut().zip(scene.bodies.iter()) {
+                    *sel = names.iter().any(|n| n == &b.name);
+                }
+                log::info!("selected by name: {} part(s)", selected.iter().filter(|&&s| s).count());
+            }
+            // The Mac is told what is hidden whenever that changes.
+            if hidden != hidden_sent && voice::MAC.lock().ok().is_some_and(|m| m.is_some()) {
+                hidden_sent = hidden.clone();
+                voice::sync_hidden(names_where(&scene, &hidden));
             }
             // A spoken or typed command the server recognised: the same button, one a frame.
             if key_btn.is_none() {
@@ -4655,6 +4669,29 @@ fn run(app: &Host) {
                     let now = 1.6 * sc / longest_m;
                     SIZE_STEPS.iter().position(|&x| (now / x - 1.0).abs() < 0.05)
                 };
+                // For tests without a headset (SCVIEW_DEBUG_RAY=1): what the viewer holds, ten times a second.
+                if debug_ray {
+                    debug_state_n = debug_state_n.wrapping_add(1);
+                    if debug_state_n % 6 == 0 {
+                        let names = |v: &Vec<bool>| scene.bodies.iter().zip(v).filter(|(_, &on)| on).map(|(b, _)| b.name.as_str()).collect::<Vec<_>>().join(",");
+                        log::info!(
+                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?}",
+                            hovered.map_or("-", |i| scene.bodies[i].name.as_str()),
+                            names(&selected),
+                            selected_faces.len(),
+                            selected_edges.len(),
+                            names(&hidden),
+                            section,
+                            cut,
+                            measuring,
+                            measure,
+                            explode,
+                            if edge_mode { "edges" } else if face_mode { "faces" } else { "parts" },
+                            pushing,
+                            pp_drag.as_ref().map(|d| d.6)
+                        );
+                    }
+                }
                 let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);

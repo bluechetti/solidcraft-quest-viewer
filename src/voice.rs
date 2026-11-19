@@ -930,6 +930,12 @@ fn show_answer(json: &str) {
     if json.contains("\"changed\": true") || json.contains("\"changed\":true") {
         CHANGES.fetch_add(1, Ordering::SeqCst);
     }
+    // The request named parts to select ("select the posts"): the render loop selects them.
+    if let Some(names) = json_string(json, "select") {
+        if let Ok(mut q) = SELECT_IN.lock() {
+            *q = Some(names.split('\u{1f}').map(str::to_string).collect());
+        }
+    }
     // The request was a command's phrase ("hide these"): the render loop runs it as that button.
     if let Some(id) = json_string(json, "command") {
         if let Ok(mut q) = COMMANDS_IN.lock() {
@@ -951,6 +957,22 @@ fn show_answer(json: &str) {
         }
         None => set_status("", Some(&heard), Some(&reply)),
     }
+}
+
+/// Parts the server found for a "select ..." request, for the render loop to select (replacing the selection).
+static SELECT_IN: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+pub fn take_select() -> Option<Vec<String>> {
+    SELECT_IN.lock().ok()?.take()
+}
+
+/// Tells the Mac which parts are hidden in the headset (POST /visibility), so the AI knows what the wearer
+/// cannot see. Sent when the set changes; nothing is shown for it.
+pub fn sync_hidden(names: Vec<String>) {
+    std::thread::spawn(move || {
+        let list = names.iter().map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""))).collect::<Vec<_>>().join(",");
+        let _ = post_typed("/visibility", b"", "text/plain", 10, &format!("X-Hidden: {}\r\n", percent(&format!("[{list}]"))));
+    });
 }
 
 /// Commands the server recognised in a spoken or typed request, for the render loop to run, oldest first.
