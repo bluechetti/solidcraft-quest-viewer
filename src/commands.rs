@@ -29,8 +29,8 @@ pub struct Command {
 
 #[rustfmt::skip]
 pub const COMMANDS: &[Command] = &[
-    Command { id: "edit.undo", label: "Undo the last change", button: Button::Undo, keys: &[(K::Z, false)], also: "", say: &[] },
-    Command { id: "edit.redo", label: "Redo", button: Button::Redo, keys: &[(K::Y, false), (K::Z, true)], also: "", say: &[] },
+    Command { id: "edit.undo", label: "Undo the last change", button: Button::Undo, keys: &[(K::Z, false)], also: "", say: &["undo", "undo that", "undo it", "undo the last change", "go back"] },
+    Command { id: "edit.redo", label: "Redo", button: Button::Redo, keys: &[(K::Y, false), (K::Z, true)], also: "", say: &["redo", "redo that", "redo it"] },
     Command { id: "view.hide", label: "Hide the selected parts", button: Button::Hide, keys: &[(K::H, false)], also: "Del", say: &["hide", "hide this", "hide these", "hide it", "hide them", "hide the selection"] },
     Command { id: "view.isolate", label: "Show only the selected parts", button: Button::Isolate, keys: &[(K::I, false)], also: "", say: &["isolate", "isolate this", "isolate these", "isolate it", "show only this", "show only these"] },
     Command { id: "view.show_all", label: "Show every part", button: Button::ShowAll, keys: &[(K::A, false)], also: "", say: &["show all", "show everything", "unhide all", "unhide everything"] },
@@ -90,7 +90,7 @@ pub fn table_md() -> String {
     for c in COMMANDS {
         let keys: Vec<String> = c.keys.iter().map(|&(k, sh)| format!("Ctrl+{}{}", if sh { "Shift+" } else { "" }, key_name(k))).collect();
         let keys = if c.also.is_empty() { keys.join(", ") } else { format!("{}, {}", keys.join(", "), c.also) };
-        let say = if c.say.is_empty() { "(handled by the server: \"undo\", \"redo\")".to_string() } else { c.say.join(", ") };
+        let say = c.say.join(", ");
         s.push_str(&format!("| `{}` | {} | {} | {} |\n", c.id, c.label, keys, say));
     }
     s

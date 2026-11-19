@@ -919,6 +919,10 @@ struct PanelState {
     /// The floating on-screen keyboard is open.
     kb_open: bool,
     /// Which page of the full reply is shown.
+    /// What Undo and Redo would take back or bring back: "" (nothing), "model" (the Mac says what, see
+    /// voice::history), or the words to show.
+    undo_what: &'static str,
+    redo_what: &'static str,
     reply_page: usize,
     /// The page of the dimensions list on view.
     dims_page: usize,
@@ -1439,6 +1443,16 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
     // The title; the second line is the name and shortcut of the button pointed at, else the subtitle.
     let hint = hover.map(|b| {
         let key = panel::shortcut(b);
+        // Undo and Redo say what they would do.
+        let what = match b {
+            Button::Undo => Some(("Undo", st.undo_what, voice::history().0)),
+            Button::Redo => Some(("Redo", st.redo_what, voice::history().1)),
+            _ => None,
+        };
+        if let Some((verb, what, from_mac)) = what.filter(|w| !w.1.is_empty()) {
+            let what = if what == "model" && !from_mac.is_empty() { from_mac } else if what == "model" { "the last change".to_string() } else { what.to_string() };
+            return format!("{verb}: {what}  [{key}]");
+        }
         if key.is_empty() {
             label(b, st, false).to_string()
         } else {
@@ -2624,6 +2638,14 @@ fn run(app: &Host) {
             NoteMoved(String, String),
             NoteText(String, String),
         }
+        /// What a step is, for the Undo and Redo hints.
+        fn step_what(s: &UndoStep) -> &'static str {
+            match s {
+                UndoStep::Visibility(_) => "show / hide",
+                UndoStep::Model => "model",
+                UndoStep::NoteAdded(_) | UndoStep::NoteDeleted(_) | UndoStep::NoteMoved(..) | UndoStep::NoteText(..) => "a note",
+            }
+        }
         let mut undo: Vec<UndoStep> = Vec::new();
         // Steps undone, for Redo (newest last); any new change clears it.
         let mut redo: Vec<UndoStep> = Vec::new();
@@ -3206,6 +3228,7 @@ fn run(app: &Host) {
                 selected_edges.clear();
                 edge_cache = None;
                 log::info!("new model: {tris} triangles uploaded in {} ms", t.elapsed().as_millis());
+                voice::fetch_history();
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -4625,7 +4648,7 @@ fn run(app: &Host) {
                     let now = 1.6 * sc / longest_m;
                     SIZE_STEPS.iter().position(|&x| (now / x - 1.0).abs() < 0.05)
                 };
-                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, reply_page, dims_page, overlay, overlay_hover };
+                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
                 let ni = ui.indices.len().min(UI_MAX_INDICES) / 6 * 6;

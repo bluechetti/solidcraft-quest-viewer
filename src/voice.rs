@@ -287,6 +287,28 @@ fn model_history(path: &'static str, msg: &str) {
             Err(e) => set_status("", None, Some(&e)),
         }
         BUSY.store(false, Ordering::SeqCst);
+        fetch_history();
+    });
+}
+
+/// What the Mac's Undo and Redo would do next, in words ("thickness = 12"); "" when there is nothing.
+static HISTORY: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+pub fn history() -> (String, String) {
+    HISTORY.lock().map(|h| h.clone()).unwrap_or_default()
+}
+
+/// Fetches what Undo and Redo would do next (GET /history.txt) in the background.
+pub fn fetch_history() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/history.txt", 10) {
+            let text = String::from_utf8_lossy(&b).to_string();
+            let first = |kind: &str| text.lines().find_map(|l| l.strip_prefix(kind).and_then(|r| r.strip_prefix('\t'))).unwrap_or("").to_string();
+            if let Ok(mut h) = HISTORY.lock() {
+                *h = (first("u"), first("r"));
+            }
+        }
     });
 }
 
@@ -733,6 +755,10 @@ pub fn set_dim(id: &str, value: f32) {
     let id = id.to_string();
     std::thread::spawn(move || {
         let r = post_typed("/dimension", b"", "text/plain", 30, &format!("X-Name: {}\r\nX-Value: {}\r\n", percent(&id), value));
+        // A change the panel's Undo can take back, like any other change to the model.
+        if r.as_ref().is_ok_and(|json| json.contains("\"changed\": true")) {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+        }
         say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
         fetch_dims();
     });

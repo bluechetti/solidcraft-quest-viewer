@@ -6,8 +6,8 @@ or the terminal of the desktop build as `^h`), and by saying or typing one of it
 
 | Command | What it does | Keyboard | Say or type |
 |---|---|---|---|
-| `edit.undo` | Undo the last change | Ctrl+Z | (handled by the server: "undo", "redo") |
-| `edit.redo` | Redo | Ctrl+Y, Ctrl+Shift+Z | (handled by the server: "undo", "redo") |
+| `edit.undo` | Undo the last change | Ctrl+Z | undo, undo that, undo it, undo the last change, go back |
+| `edit.redo` | Redo | Ctrl+Y, Ctrl+Shift+Z | redo, redo that, redo it |
 | `view.hide` | Hide the selected parts | Ctrl+H, Del | hide, hide this, hide these, hide it, hide them, hide the selection |
 | `view.isolate` | Show only the selected parts | Ctrl+I | isolate, isolate this, isolate these, isolate it, show only this, show only these |
 | `view.show_all` | Show every part | Ctrl+A | show all, show everything, unhide all, unhide everything |
