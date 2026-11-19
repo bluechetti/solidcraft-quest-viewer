@@ -775,6 +775,15 @@ pub fn clear_clash() {
     }
 }
 
+/// The wearer switched the marks off: forget them, and have the Mac show the design without the overlaps'
+/// own red bodies again (POST /interference with X-Clear).
+pub fn drop_clash() {
+    clear_clash();
+    std::thread::spawn(|| {
+        let _ = post_typed("/interference", b"", "text/plain", 60, "X-Clear: 1\r\n");
+    });
+}
+
 /// Asks the Mac which parts overlap (POST /interference). The bodies found are marked and selected, so
 /// Isolate shows only those; the reply names the pairs and their overlap.
 pub fn check_clash() {
@@ -811,6 +820,9 @@ pub struct Handle {
     /// The least and most the value may be (a joint's limits; a size stays above 0.1).
     pub min: f32,
     pub max: f32,
+    /// A joint's handle: whether it turns (else it slides), its origin and axis in the model, and the
+    /// bodies it carries, so they can be shown moving while it is dragged.
+    pub joint: Option<(bool, [f32; 3], [f32; 3], Vec<String>)>,
 }
 
 /// The handles of the model on show (empty until fetched, or when the design has none).
@@ -829,7 +841,7 @@ pub fn fetch_handles() {
                         return None;
                     }
                     let n = |i: usize| f[i].parse::<f32>().ok();
-                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)?, min: f.get(12).and_then(|v| v.parse().ok()).unwrap_or(if f.len() > 12 { f32::NEG_INFINITY } else { 0.1 }), max: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(f32::INFINITY) })
+                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)?, min: f.get(12).and_then(|v| v.parse().ok()).unwrap_or(if f.len() > 12 { f32::NEG_INFINITY } else { 0.1 }), max: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(f32::INFINITY), joint: if f.len() >= 22 { Some((f[14] == "revolute", [n(15)?, n(16)?, n(17)?], [n(18)?, n(19)?, n(20)?], f[21].split('\u{1f}').map(str::to_string).collect())) } else { None } })
                 })
                 .collect();
             log::info!("handles: {} on the model", list.len());

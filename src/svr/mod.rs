@@ -13,10 +13,12 @@
 //! the desktop app's VR mode.
 //!
 //! `precise.rs` is this viewer's own (not from the pull request): the slow, snapped drag every tool shares.
+//! So is `radial.rs`: the sector arithmetic of the radial menu.
 #![allow(dead_code)]
 
 pub mod grab;
 pub mod precise;
+pub mod radial;
 pub mod room;
 
 use vector::finite;

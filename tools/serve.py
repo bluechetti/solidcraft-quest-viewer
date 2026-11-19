@@ -1042,6 +1042,93 @@ def check_clashes():
     return f"{len(clashes)} overlap{'s' if len(clashes) != 1 else ''}: {said}{more}.{tail}", clashes
 
 
+def overlap_mesh(pairs):
+    """The design's mesh with each pair's overlap added as a body of its own ("Overlap 1", ...), for the
+    headset to show in red inside the parts. Made inside a checkpoint: the design is left as it was.
+    None if SolidCraft could not make any of them."""
+    text, err = session.call("execute", {"command": "edit.checkpoint", "params": {}})
+    if err:
+        return None
+    cp, made, data = json.loads(text)["checkpoint"], 0, None
+    try:
+        for n, c in enumerate(pairs[:20], 1):
+            text, err = session.call("execute", {"command": "component.copy_bodies", "params": {"bodies": [c["a"]]}})
+            copy = None if err else next(iter(json.loads(text).get("bodies") or []), None)
+            if not copy:
+                log(f"overlap {n}: no copy of {c['a']}: {text[:120]}")
+                continue
+            text, err = session.call("execute", {"command": "solid.combine", "params": {"target": copy, "tools": [c["b"]], "operation": "intersect", "keep_tools": True}})
+            if err:
+                log(f"overlap {n}: {text[:120]}")
+                session.call("undo", {})
+                continue
+            session.call("execute", {"command": "body.rename", "params": {"body": copy, "name": f"Overlap {n}"}})
+            made += 1
+        if made:
+            data = export_bytes()
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as e:
+        log(f"overlap mesh: {e}")
+    finally:
+        text, err = session.call("execute", {"command": "edit.restore_checkpoint", "params": {"checkpoint": cp}})
+        if err:
+            log(f"overlap mesh: the design could not be put back: {text[:200]}")
+    return data
+
+
+SWEEP = re.compile(r"^(?:sweep|check (?:the )?motion of|check (?:the )?travel of|where does) (?:the )?(?P<name>[a-z0-9_ ]+?)(?: joint)?(?: collide| hit| touch| clash)?$")
+
+
+def sweep_joint(dim):
+    """Take a joint through its whole travel on a copy of the design and say where parts run into each
+    other: the reply, and [(part a, part b, from value, to value, most volume)]. Changes nothing."""
+    j = next((x for x in joints() if x["id"] == dim["joint"]), None)
+    if j is None or j["min"] is None or j["max"] is None:
+        return f"{dim['feature']} has no limits to sweep between; give it limits in SolidCraft first.", []
+    lo, hi = j["min"], j["max"]
+    steps = int(max(10, min(400, round(hi - lo))))
+    text, err = session.call("execute", {"command": "edit.checkpoint", "params": {}})
+    if err:
+        return f"SolidCraft could not sweep: {text[:120]}", []
+    cp, hits, said = json.loads(text)["checkpoint"], [], ""
+    try:
+        text, err = session.call("execute", {"command": "motion.study", "params": {"name": "scview sweep", "steps": steps, "keys": [{"joint": j["id"], "points": [[0, lo], [steps, hi]]}]}})
+        if err:
+            return f"SolidCraft could not sweep {dim['feature']}: {text[:120]}", []
+        text, err = session.call("execute", {"command": "motion.interference", "params": {"study": "scview sweep", "samples": steps + 1}})
+        if err:
+            return f"SolidCraft could not sweep {dim['feature']}: {text[:120]}", []
+        r = json.loads(text)
+        at = lambda step: round(lo + (hi - lo) * step / steps, 2)
+        for c in r.get("collisions", []):
+            for a, b in c.get("steps") or [[c.get("first_step", 0), c.get("last_step", 0)]]:
+                hits.append((str(c["a"]), str(c["b"]), at(a), at(b), c.get("volume_mm3")))
+        if r.get("truncated"):
+            said = " The check ran out of time before the end."
+    finally:
+        text, err = session.call("execute", {"command": "edit.restore_checkpoint", "params": {"checkpoint": cp}})
+        if err:
+            log(f"sweep: the design could not be put back: {text[:200]}")
+    names = occurrence_names()
+    hits = [(names.get(a, a).split(":")[0], names.get(b, b).split(":")[0], f, t, v) for a, b, f, t, v in hits]
+    unit = j["unit"]
+    log(f"sweep {dim['label']} {lo:g}..{hi:g} {unit} in {steps} steps: {hits}")
+    if not hits:
+        return f"{dim['feature']} is clear all the way, {lo:g} to {hi:g} {unit}.{said}", []
+    parts = "; ".join(f"{a} and {b} from {f:g} to {t:g} {unit}" for a, b, f, t, _ in hits[:3])
+    now = f" It is at {j['value']:g} now." 
+    return f"{dim['feature']}, {lo:g} to {hi:g} {unit}: {parts} overlap.{now}{said}", hits
+
+
+def occurrence_names():
+    """{a component's id (as motion.interference names the parts), as text: its name}, for replies."""
+    text, err = session.call("execute", {"command": "assembly.mass_properties", "params": {}})
+    out = {}
+    if not err:
+        for o in json.loads(text).get("occurrences", []):
+            out[str(o.get("component"))] = str(o.get("name", o.get("component"))).rsplit(":", 1)[0]
+    return out
+
+
 def clashes_text():
     """For the headset, the last check's pairs: body a, body b, volume (mm3), centre x y z, part a, part b."""
     return "".join("\t".join([c["a"], c["b"], f"{c['volume']:.3f}", *(f"{x:.3f}" for x in c["center"]), c["a_part"], c["b_part"]]) + "\n" for c in clashes).encode()
@@ -1125,6 +1212,14 @@ def direct_request(text):
     "increase thickness by 2") is done here, with no AI: (reply, changed). Anything else returns None."""
     t = re.sub(r"\s+", " ", text.lower().strip(" .!?,"))
     t = re.sub(r"^(?:please|can you|could you)\s+", "", t)
+    sw = SWEEP.match(t)
+    if sw:
+        try:
+            dim = find_dimension(sw["name"], [d for d in dimensions() if d["kind"] == "joint"])
+        except (RuntimeError, ValueError):
+            dim = None
+        if dim is not None:
+            return sweep_joint(dim)[0], False
     m = DIRECT_REL.match(t) or DIRECT_SET.match(t) or DIRECT_BARE.match(t)
     if not m:
         return None
@@ -1325,13 +1420,28 @@ def handles():
     # that turns and moves the way that edge swings (so many degrees for each unit moved).
     js = joints()
     of = occurrence_bodies() if js else {}
+
+    def carried(j):
+        """The bodies that move when joint j does: its b side, and whatever is joined on beyond it."""
+        seen, todo = {j["b"]}, [j["b"]]
+        while todo:
+            o = todo.pop()
+            for other in js:
+                if other["id"] != j["id"] and o in (other["a"], other["b"]):
+                    nxt = other["b"] if other["a"] == o else other["a"]
+                    if nxt != j["a"] and nxt not in seen:
+                        seen.add(nxt)
+                        todo.append(nxt)
+        return [n for o in sorted(seen) for n in of.get(o, [])]
+
     for j in js:
         if not (j["origin"] and j["z"]):
             continue
         o, z = j["origin"], j["z"]
         body = next(iter(of.get(j["b"], [])), None)
         bb = boxes.get(body)
-        base = {"id": f"joint:{j['id']}", "label": f"{j['name']} {j['what']}", "value": j["value"], "unit": j["unit"], "body": body or "", "min": j["min"], "max": j["max"]}
+        base = {"id": f"joint:{j['id']}", "label": f"{j['name']} {j['what']}", "value": j["value"], "unit": j["unit"], "body": body or "", "min": j["min"], "max": j["max"],
+                "joint": [j["type"], *(f"{x:g}" for x in o), *(f"{x:g}" for x in z), "\x1f".join(carried(j))]}
         if j["type"] == "slider" and bb:
             top = [(a + b) / 2 for a, b in zip(bb["min"], bb["max"])]
             k = max(range(3), key=lambda i: abs(z[i]))
@@ -1353,12 +1463,14 @@ def handles():
 
 def handles_text():
     """For the headset, one handle per line: id, label, value, unit, at x y z, dir x y z, gain, body, and the
-    least and most the value may be ("-" for no limit), tab-separated."""
+    least and most the value may be ("-" for no limit), tab-separated. A joint's line goes on: its type, its
+    origin x y z and axis x y z in the model, and the bodies it carries (joined by \x1f), so the headset can
+    show them moving while the handle is dragged."""
     if session is None:
         return b""
     try:
         return "".join("\t".join([h["id"], h["label"], f"{h['value']:g}", h["unit"], *(f"{x:g}" for x in h["at"]), *(f"{x:g}" for x in h["dir"]),
-                                  f"{h['gain']:g}", h["body"], *("-" if h[k] is None else f"{h[k]:g}" for k in ("min", "max"))]) + "\n" for h in handles()).encode()
+                                  f"{h['gain']:g}", h["body"], *("-" if h[k] is None else f"{h[k]:g}" for k in ("min", "max")), *h.get("joint", [])]) + "\n" for h in handles()).encode()
     except (RuntimeError, ValueError, KeyError) as e:
         log(f"handles: {e}")
         return b""
@@ -1645,7 +1757,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
-                             "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move", "/interference"):
+                             "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move", "/interference", "/sweep"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1786,12 +1898,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # headset selects them, so Isolate shows only those); /clashes.txt has the pairs.
             reply, pairs = "Checking for overlaps needs a STEP or .sc source.", []
             try:
+                if session is not None and self.headers.get("X-Clear"):
+                    # The marks are switched off: show the design as it is again.
+                    clashes.clear()
+                    export_scm()
+                    self.reply_json({"heard": "", "reply": "", "ok": True, "changed": False, "clashes": 0})
+                    return
                 if session is not None:
                     reply, pairs = check_clashes()
+                    solid = overlap_mesh(pairs) if pairs else None
+                    if solid:
+                        publish(solid)
             except (RuntimeError, ValueError) as e:
                 reply = f"The check failed: {e}"
             names = sorted({n for c in pairs for n in (c["a"], c["b"])})
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False, "clashes": len(pairs), **({"select": "\x1f".join(names)} if names else {})})
+            return
+        if self.path == "/sweep":
+            # A joint taken through its travel on a copy: where parts overlap on the way. X-Name: the joint.
+            reply = "A sweep needs a STEP or .sc source."
+            hits = []
+            try:
+                if session is not None:
+                    name = urllib.parse.unquote(self.headers.get("X-Name", ""))
+                    dim = find_dimension(name, [d for d in dimensions() if d["kind"] == "joint"])
+                    reply, hits = sweep_joint(dim) if dim else (f"No joint is called \"{name}\".", [])
+            except (RuntimeError, ValueError) as e:
+                reply = f"The sweep failed: {e}"
+            self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False, "hits": [list(h) for h in hits]})
             return
         if self.path == "/move":
             # Move a part. X-Body: its name; X-Translate: "dx\tdy\tdz" in model units, or X-From and X-To

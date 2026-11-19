@@ -53,6 +53,8 @@ const SELECT_EDGE_TINT: [f32; 4] = [1.0, 0.5, 0.05, 1.0];
 const PREVIEW_TINT: [f32; 4] = [0.2, 0.95, 0.4, 0.55];
 /// Parts the interference check found overlapping.
 const CLASH_TINT: [f32; 4] = [1.0, 0.12, 0.1, 0.6];
+/// The overlap of two parts, shown as a body of its own.
+const OVERLAP_TINT: [f32; 4] = [1.0, 0.05, 0.05, 0.9];
 
 type M4 = [f32; 16];
 
@@ -728,6 +730,7 @@ enum Button {
     Handles,
     Move,
     Clash,
+    Radial,
     ConfirmGo,
     ConfirmStop,
     CancelVoice,
@@ -949,6 +952,32 @@ struct PanelState {
 
 /// A button's name: short (beside its icon) or long (the hint when it is pointed at). It says what
 /// pressing the button does next, except for Edges, Guides and Faces, which show what is on now.
+/// A choice's name on the radial menu: what it does, whatever state the tool is in.
+fn radial_label(b: Button) -> &'static str {
+    match b {
+        Button::Hide => "Hide",
+        Button::Isolate => "Isolate",
+        Button::ShowAll => "Show all",
+        Button::Clear => "Deselect",
+        Button::Recentre => "Recentre",
+        Button::Undo => "Undo",
+        Button::Redo => "Redo",
+        Button::Section => "Section",
+        Button::Measure => "Measure",
+        Button::Explode => "Explode",
+        Button::Note => "Note",
+        Button::Faces => "Parts/faces",
+        Button::PushPull => "Push/pull",
+        Button::Size => "Size",
+        Button::Models => "Models",
+        Button::Dims => "Dimensions",
+        Button::Handles => "Handles",
+        Button::Move => "Move",
+        Button::Clash => "Overlaps",
+        _ => "?",
+    }
+}
+
 fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
     let PanelState { room_off, section, measuring, edges, exploded, noting, faces, pick_edges, pushing, placing, size_idx, guides, overlay, .. } = *st;
     let sel = st.notes_selected > 0;
@@ -988,6 +1017,7 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Keep (save) the last request to repeat"
             }
         }
+        Button::Radial => if short { "Menu" } else { "Radial menu at the pointing hand" },
         Button::Clash => match (st.clash, short) {
             (true, true) => "No marks",
             (false, true) => "Overlaps",
@@ -2779,6 +2809,8 @@ fn run(app: &Host) {
         let stick_click = action_set.create_action::<bool>("stick_click", "Thumbstick click", &hand_paths).unwrap();
         // B (right controller): the AI carries out the note pointed at.
         let b_button = action_set.create_action::<bool>("b_button", "B button", &hand_paths).unwrap();
+        // A short buzz in the pointing hand: a dragged value has reached its limit.
+        let haptic = action_set.create_action::<xr::Haptic>("haptic", "Buzz", &hand_paths).unwrap();
         {
             let p = |s: &str| xr_instance.string_to_path(s).unwrap();
             let bindings = [
@@ -2797,6 +2829,7 @@ fn run(app: &Host) {
                 xr::Binding::new(&stick_click, p("/user/hand/left/input/thumbstick/click")),
                 xr::Binding::new(&stick_click, p("/user/hand/right/input/thumbstick/click")),
                 xr::Binding::new(&b_button, p("/user/hand/right/input/b/click")),
+                xr::Binding::new(&haptic, p("/user/hand/right/output/haptic")),
             ];
             if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/oculus/touch_controller"), &bindings) {
                 log::info!("controller bindings: {e:?}");
@@ -2820,6 +2853,7 @@ fn run(app: &Host) {
                     xr::Binding::new(&trigger, p("/user/hand/right/input/trigger/value")),
                     xr::Binding::new(&stick_click, p("/user/hand/left/input/thumbstick/click")),
                     xr::Binding::new(&stick_click, p("/user/hand/right/input/thumbstick/click")),
+                    xr::Binding::new(&haptic, p("/user/hand/right/output/haptic")),
                 ];
                 if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/microsoft/motion_controller"), &wmr) {
                     log::info!("desktop controller bindings: {e:?}");
@@ -2862,9 +2896,19 @@ fn run(app: &Host) {
         // point it was taken by (model units), the hand's place in the room then, and the move so far.
         let mut moving = false;
         let mut move_drag: Option<(usize, [f32; 3], [f32; 3], [svr::precise::Drag; 3], [f32; 3])> = None;
+        // The radial menu: opened at the pointing hand by pressing the right thumbstick (or Ctrl+Shift+R, or
+        // saying "menu"). Its choices depend on what is pointed at. Pushing the stick, or moving the hand,
+        // towards a choice marks it; letting the stick go (or the trigger) runs it as that button. The
+        // menu: the hand's pose when it opened, its choices, the one marked, whether the stick opened it,
+        // and what it is a menu for.
+        let mut radial: Option<(M4, Vec<Button>, Option<usize>, bool, &'static str)> = None;
+        let mut radial_ran = 0u32;
         let mut handles_on = false;
         let mut handle_hover: Option<usize>;
         let mut handle_drag: Option<(usize, svr::precise::Drag, [f32; 3], [f32; 3], f32)> = None;
+        // The dragged value is at its limit (the hand buzzes once when it gets there).
+        let mut handle_at_limit = false;
+        let mut buzzes = 0u32;
         let mut guides = Guides::Off;
         let mut tab = panel::Tab::Select;
         let mut kb_shift = false;
@@ -3233,7 +3277,7 @@ fn run(app: &Host) {
                 log::info!("grab {mode}; held L {} R {}, tracked L {} R {}", held[0], held[1], hand[0].is_some(), hand[1].is_some());
                 grab_mode = mode;
             }
-            if !grab.holding() {
+            if !grab.holding() && radial.is_none() {
                 if let Ok(st) = stick.state(&session, hand_paths[1]) {
                     let v = st.current_state;
                     if st.is_active && (v.x.abs() > 0.2 || v.y.abs() > 0.2) {
@@ -3342,7 +3386,11 @@ fn run(app: &Host) {
                 voice::fetch_history();
                 voice::fetch_explodes();
                 voice::fetch_handles();
-                voice::clear_clash();
+                // The mesh that follows a check carries the overlaps as bodies of their own: the marks stay
+                // with it. Any other new mesh means the design changed, and the check no longer holds.
+                if !scene.bodies.iter().any(|b| b.name.starts_with("Overlap ")) {
+                    voice::clear_clash();
+                }
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -3833,6 +3881,67 @@ fn run(app: &Host) {
                 let pages = (reply_lines().len() + REPLY_ROWS - 1) / REPLY_ROWS;
                 reply_page = if pages == 0 { 0 } else { (reply_page + 1) % pages };
             }
+            // The radial menu.
+            let stick_down = stick_click.state(&session, hand_paths[1]).map(|st| st.current_state).unwrap_or(false);
+            let mut radial_took_trigger = false;
+            if radial.is_none() && (key_btn == Some(Button::Radial) || (stick_down && !click_was[1])) {
+                if let Some((pm, _)) = ray {
+                    let by_stick = key_btn != Some(Button::Radial);
+                    let any_selected = selected.iter().any(|s| *s);
+                    let (what, items): (&'static str, Vec<Button>) = if face_mode && hovered_face.is_some() {
+                        ("face", vec![Button::PushPull, Button::Measure, Button::Section, Button::Note, Button::Faces, Button::Clear, Button::Undo, Button::Redo])
+                    } else if hovered.is_some() || any_selected {
+                        ("part", vec![Button::Hide, Button::Isolate, Button::Move, Button::Measure, Button::Handles, Button::Dims, Button::Undo, Button::Redo])
+                    } else {
+                        ("nothing", vec![Button::ShowAll, Button::Recentre, Button::Explode, Button::Size, Button::Models, Button::Clash, Button::Undo, Button::Redo])
+                    };
+                    // A menu for the part pointed at acts on it: it is selected if nothing is.
+                    if let (Some(b), false, "part") = (hovered, any_selected, what) {
+                        selected[b] = true;
+                    }
+                    let line: Vec<String> = items.iter().enumerate().map(|(i, b)| format!("{} {}", svr::radial::way(i, items.len()), radial_label(*b))).collect();
+                    log::info!("radial: open for {what}: {}", line.join(" | "));
+                    let names: Vec<&str> = items.iter().map(|b| radial_label(*b)).collect();
+                    voice::say(&format!("Menu, from up, clockwise: {}", names.join(", ")));
+                    radial = Some((pm, items, None, by_stick, what));
+                }
+                key_btn = None;
+            } else if key_btn == Some(Button::Radial) {
+                log::info!("radial: closed, nothing run");
+                voice::say("");
+                radial = None;
+                key_btn = None;
+            } else if let Some((pm0, items, pick, by_stick, _)) = radial.as_mut() {
+                // The choice: the way the stick is pushed, else the way the hand has moved since it opened.
+                let pushed = stick.state(&session, hand_paths[1]).ok().map(|st| st.current_state).filter(|v| v.x.abs() > 0.3 || v.y.abs() > 0.3);
+                let now = match (pushed, ray) {
+                    (Some(v), _) => svr::radial::sector(v.x, v.y, items.len(), 0.5),
+                    (None, Some((pm, _))) => {
+                        let d = sub([pm[12], pm[13], pm[14]], [pm0[12], pm0[13], pm0[14]]);
+                        svr::radial::sector(dot(d, [pm0[0], pm0[1], pm0[2]]), dot(d, [pm0[4], pm0[5], pm0[6]]), items.len(), 0.04)
+                    }
+                    _ => *pick,
+                };
+                if now != *pick {
+                    *pick = now;
+                    voice::say(&now.map_or("Menu: let go here for nothing".to_string(), |i| format!("Menu: {} ({})", radial_label(items[i]), svr::radial::way(i, items.len()))));
+                }
+                let take = if *by_stick { !stick_down } else { trig && !trigger_was };
+                if take {
+                    radial_took_trigger = !*by_stick;
+                    match *pick {
+                        Some(i) => {
+                            radial_ran += 1;
+                            log::info!("radial: {:?} run ({})", items[i], svr::radial::way(i, items.len()));
+                            key_btn = Some(items[i]);
+                        }
+                        // The stick pressed and let go without a push: what that press has always done.
+                        None if *by_stick => key_btn = Some(Button::Hide),
+                        None => log::info!("radial: closed, nothing run"),
+                    }
+                    radial = None;
+                }
+            }
             // Dimension handles: which one the pointer is on, the drag of one, and the press that starts it.
             let handle_list = if handles_on { voice::HANDLES.lock().map(|h| h.clone()).unwrap_or_default() } else { Vec::new() };
             let handle_len = 0.05 / unit; // the arrow's length, in model units (5 cm in the room)
@@ -3876,7 +3985,15 @@ fn run(app: &Host) {
                             // Whole degrees or millimetres; tenths with the grip.
                             now = if fine { (now * 10.0).round() / 10.0 } else { now.round() };
                         }
+                        let stopped = now < h.min || now > h.max;
                         let now = now.clamp(h.min, h.max);
+                        if stopped && !handle_at_limit {
+                            buzzes += 1;
+                            let buzz = xr::HapticVibration::new().amplitude(0.8).duration(xr::Duration::from_nanos(70_000_000)).frequency(xr::FREQUENCY_UNSPECIFIED);
+                            let sent = haptic.apply_feedback(&session, hand_paths[1], &buzz);
+                            log::info!("haptic: buzz {buzzes}, {} at its limit of {} {} ({:?})", h.label, now, h.unit, sent.map(|_| "sent"));
+                        }
+                        handle_at_limit = stopped;
                         if (now - *value).abs() > 1e-4 {
                             *value = now;
                             voice::say(&format!("{}: {} {}", h.label, fmt_dim(now), h.unit));
@@ -3933,20 +4050,21 @@ fn run(app: &Host) {
                     move_drag = None;
                 }
             }
-            let move_click = trig && !trigger_was && key_btn.is_none() && moving && move_drag.is_none() && !on_panel && !on_kb && hovered.is_some() && hit_point.is_some();
+            let move_click = trig && !trigger_was && key_btn.is_none() && radial.is_none() && !radial_took_trigger && moving && move_drag.is_none() && !on_panel && !on_kb && hovered.is_some() && hit_point.is_some();
             if let (true, Some(b), Some(p), Some((pm, _))) = (move_click, hovered, hit_point, ray) {
                 move_drag = Some((b, sub(p, off(b)), [pm[12], pm[13], pm[14]], [svr::precise::Drag::start(0.0, 0.0); 3], [0.0; 3]));
                 log::info!("move {}: taken hold of", scene.bodies[b].name);
             }
-            let handle_click = trig && !trigger_was && key_btn.is_none() && handle_drag.is_none() && handle_hover.is_some() && !move_click;
+            let handle_click = trig && !trigger_was && key_btn.is_none() && radial.is_none() && handle_drag.is_none() && handle_hover.is_some() && !move_click;
             if let (true, Some(i), Some((pm, _))) = (handle_click, handle_hover, ray) {
                 if let Some(h) = handle_list.get(i) {
                     let dir_w = normalize(transform(&model, h.dir, 0.0));
                     handle_drag = Some((i, svr::precise::Drag::start(0.0, 0.0), [pm[12], pm[13], pm[14]], dir_w, h.value));
+                    handle_at_limit = false;
                     log::info!("handle {}: taken hold of at {}", h.label, h.value);
                 }
             }
-            if ((trig && !trigger_was) && !handle_click && handle_drag.is_none() && !move_click && move_drag.is_none()) || key_btn.is_some() {
+            if ((trig && !trigger_was) && radial.is_none() && !radial_took_trigger && !handle_click && handle_drag.is_none() && !move_click && move_drag.is_none()) || key_btn.is_some() {
                 if let (true, None) = (on_kb, key_btn) {
                     // The on-screen keyboard: a key types into the request line; the bar is taken hold of to move it.
                     match kb_hover {
@@ -4121,11 +4239,12 @@ fn run(app: &Host) {
                             Button::ConfirmStop => voice::cancel_confirm(),
                             Button::Repeat => voice::repeat_last(),
                             Button::SaveReq => voice::save_last(),
+                            Button::Radial => {} // opened and closed above
                             Button::Clash => {
                                 if clash_names.is_empty() {
                                     voice::check_clash();
                                 } else {
-                                    voice::clear_clash();
+                                    voice::drop_clash();
                                 }
                             }
                             Button::Move => {
@@ -4605,10 +4724,7 @@ fn run(app: &Host) {
                 let click = stick_click.state(&session, hand_paths[h]).map(|st| st.current_state).unwrap_or(false);
                 if click && !click_was[h] {
                     if h == 1 {
-                        for (h, s) in hidden.iter_mut().zip(selected.iter_mut()) {
-                            *h |= *s;
-                            *s = false;
-                        }
+                        // The right stick opens the radial menu (above); pressed and let go, it hides.
                     } else {
                         hidden.iter_mut().for_each(|x| *x = false);
                         log::info!("showing all bodies");
@@ -4643,6 +4759,28 @@ fn run(app: &Host) {
             let push_for = |m: &M4, tint: [f32; 4]| push_for_cut(m, tint, NO_PLANE);
             // Extra bars drawn with the ray box (world matrices): the outline of the cut, measure points and line.
             let mut bars: Vec<(M4, [f32; 4])> = Vec::new();
+            // The radial menu: a ring of blocks where the hand was when it opened, the marked one bigger and
+            // light blue, and a line from the middle to the hand.
+            if let Some((pm0, items, pick, _, _)) = &radial {
+                // A forearm's length along the ray from where the hand was, so it is in view and not behind the controller.
+                let (right, up) = ([pm0[0], pm0[1], pm0[2]], [pm0[4], pm0[5], pm0[6]]);
+                let o = [0, 1, 2].map(|k| pm0[12 + k] - pm0[8 + k] * 0.3);
+                let at = |x: f32, y: f32| [0, 1, 2].map(|k| o[k] + right[k] * x + up[k] * y);
+                for i in 0..items.len() {
+                    let (x, y) = svr::radial::centre(i, items.len(), 0.08);
+                    let (size, tint) = if *pick == Some(i) { (0.03, [0.2, 0.75, 1.0, 1.0]) } else { (0.016, [1.0, 0.8, 0.15, 1.0]) };
+                    bars.push((bar(at(x, y - size / 2.0), at(x, y + size / 2.0), size), tint));
+                }
+                bars.push((bar(at(0.0, -0.003), at(0.0, 0.003), 0.006), [1.0, 0.8, 0.15, 1.0]));
+                // The hand's move since it opened, as a line from the middle (the ring is 8 cm out; 4 cm picks).
+                if let Some((pm, _)) = ray {
+                    let d = sub([pm[12], pm[13], pm[14]], [pm0[12], pm0[13], pm0[14]]);
+                    let (x, y) = (dot(d, right).clamp(-0.08, 0.08), dot(d, up).clamp(-0.08, 0.08));
+                    if x.abs() > 0.002 || y.abs() > 0.002 {
+                        bars.push((bar(o, at(x, y), 0.003), [1.0, 0.8, 0.15, 1.0]));
+                    }
+                }
+            }
             // Dimension handles: a thin shaft out of the model and a block at its end. The one pointed at is
             // light blue; the one being dragged is green and drawn where the value now puts it.
             for (i, h) in handle_list.iter().enumerate() {
@@ -4762,12 +4900,33 @@ fn run(app: &Host) {
             // Draw runs: consecutive bodies with the same state (and, when exploded, the same move) share
             // one draw call; hidden ones are skipped.
             let previewing = voice::preview();
+            // A joint being dragged by its handle: the bodies it carries are drawn where the value now puts
+            // them (turned about the joint's axis, or slid along it), until the Mac's new model arrives.
+            let overlaps_shown = !clash_names.is_empty() && scene.bodies.iter().any(|b| b.name.starts_with("Overlap "));
+            const LIVE: [f32; 3] = [1.0e30, 0.0, 0.0];
+            let live: Option<(Vec<bool>, M4)> = handle_drag.as_ref().and_then(|d| {
+                let h = handle_list.get(d.0)?;
+                let (turns, o, z, names) = h.joint.as_ref()?;
+                let by = d.4 - h.value;
+                let m = if *turns {
+                    mul(&mul(&translate(o[0], o[1], o[2]), &rot_axis(normalize(*z), by.to_radians())), &translate(-o[0], -o[1], -o[2]))
+                } else {
+                    translate(z[0] * by, z[1] * by, z[2] * by)
+                };
+                Some((scene.bodies.iter().map(|b| names.iter().any(|n| *n == b.name)).collect(), m))
+            });
+            let off_draw = |i: usize| if live.as_ref().is_some_and(|l| l.0[i]) { LIVE } else { off(i) };
             let mut runs: Vec<(u32, u32, Option<[f32; 4]>, [f32; 3])> = Vec::new();
             for (i, b) in scene.bodies.iter().enumerate() {
-                let tint = if hidden[i] {
+                // An overlap stays on show whatever is hidden: Isolate on the parts in it must not take it away.
+                let tint = if b.name.starts_with("Overlap ") {
+                    Some(OVERLAP_TINT)
+                } else if hidden[i] {
                     None
                 } else if clash_names.iter().any(|n| *n == b.name) {
-                    Some(CLASH_TINT)
+                    // With the overlaps there as bodies, the parts are drawn as red edges only, so the
+                    // overlap inside them shows; without, the parts themselves turn red.
+                    if overlaps_shown { None } else { Some(CLASH_TINT) }
                 } else if selected[i] {
                     Some(SELECT_TINT)
                 } else if Some(i) == hovered && !edge_mode && !face_mode && !pushing {
@@ -4778,8 +4937,8 @@ fn run(app: &Host) {
                     Some([0.0; 4])
                 };
                 match runs.last_mut() {
-                    Some(last) if last.2 == tint && last.3 == off(i) && last.0 + last.1 == b.first => last.1 += b.count,
-                    _ => runs.push((b.first, b.count, tint, off(i))),
+                    Some(last) if last.2 == tint && last.3 == off_draw(i) && last.0 + last.1 == b.first => last.1 += b.count,
+                    _ => runs.push((b.first, b.count, tint, off_draw(i))),
                 }
             }
 
@@ -4810,7 +4969,10 @@ fn run(app: &Host) {
             vk_device.cmd_bind_vertex_buffers(cmd, 0, &[vbuf], &[0]);
             vk_device.cmd_bind_index_buffer(cmd, ibuf, 0, vk::IndexType::UINT32);
             // A body moved by the exploded view: its matrix, and the cut moved back so it stays put in the model.
-            let moved = |o: [f32; 3]| (mul(&model, &translate(o[0], o[1], o[2])), [cut[0], cut[1], cut[2], cut[3] + dot([cut[0], cut[1], cut[2]], o)]);
+            let moved = |o: [f32; 3]| match &live {
+                Some((_, m)) if o == LIVE => (mul(&model, m), NO_PLANE),
+                _ => (mul(&model, &translate(o[0], o[1], o[2])), [cut[0], cut[1], cut[2], cut[3] + dot([cut[0], cut[1], cut[2]], o)]),
+            };
             let mut last_state = None;
             for &(first, count, tint, o) in &runs {
                 let Some(tint) = tint else { continue };
@@ -4830,7 +4992,9 @@ fn run(app: &Host) {
                 if hidden[i] {
                     continue;
                 }
-                let (range, tint) = if selected[i] {
+                let (range, tint) = if overlaps_shown && clash_names.iter().any(|n| *n == scene.bodies[i].name) {
+                    (scene.feat[i], [1.0, 0.15, 0.1, 1.0])
+                } else if selected[i] {
                     (scene.feat[i], SELECT_EDGE_TINT)
                 } else {
                     match edges {
@@ -4843,8 +5007,8 @@ fn run(app: &Host) {
                     continue;
                 }
                 match draws.last_mut() {
-                    Some(last) if last.2 == tint && last.3 == off(i) && last.0 + last.1 == range.0 => last.1 += range.1,
-                    _ => draws.push((range.0, range.1, tint, off(i))),
+                    Some(last) if last.2 == tint && last.3 == off_draw(i) && last.0 + last.1 == range.0 => last.1 += range.1,
+                    _ => draws.push((range.0, range.1, tint, off_draw(i))),
                 }
             }
             if !draws.is_empty() {
@@ -5014,7 +5178,7 @@ fn run(app: &Host) {
                     if debug_state_n % 6 == 0 {
                         let names = |v: &Vec<bool>| scene.bodies.iter().zip(v).filter(|(_, &on)| on).map(|(b, _)| b.name.as_str()).collect::<Vec<_>>().join(",");
                         log::info!(
-                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={} clash=[{}]",
+                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={} clash=[{}] live={} buzzes={} radial={} ran={}",
                             hovered.map_or("-", |i| scene.bodies[i].name.as_str()),
                             names(&selected),
                             selected_faces.len(),
@@ -5033,7 +5197,11 @@ fn run(app: &Host) {
                             handle_drag.as_ref().map_or("-".to_string(), |d| format!("{}", d.4)),
                             moving,
                             move_drag.as_ref().map_or("-".to_string(), |d| format!("{}:{},{},{}", scene.bodies[d.0].name, d.4[0], d.4[1], d.4[2])),
-                            clash_names.join(",")
+                            clash_names.join(","),
+                            handle_drag.as_ref().and_then(|d| handle_list.get(d.0)).and_then(|h| h.joint.as_ref()).map_or(0, |j| j.3.len()),
+                            buzzes,
+                            radial.as_ref().map_or("-".to_string(), |r| format!("{}:{}", r.4, r.2.map_or("-".to_string(), |i| format!("{:?}", r.1[i])))),
+                            radial_ran
                         );
                     }
                 }

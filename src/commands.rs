@@ -54,6 +54,7 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "ai.repeat", label: "Repeat the last request", button: Button::Repeat, keys: &[(K::T, false)], also: "", say: &["repeat", "repeat that", "again", "do it again"] },
     Command { id: "ai.keep", label: "Keep the last request", button: Button::SaveReq, keys: &[(K::W, false)], also: "", say: &["keep that", "save that request"] },
     Command { id: "ai.saved", label: "Saved requests", button: Button::Saved, keys: &[(K::Q, false)], also: "", say: &["saved requests", "show saved requests"] },
+    Command { id: "ui.radial", label: "Radial menu at the pointing hand: move towards a choice, trigger to take it", button: Button::Radial, keys: &[(K::R, true)], also: "Right thumbstick: press, push towards a choice, let go", say: &["menu", "radial menu", "open the menu"] },
     Command { id: "tool.clash", label: "Check which parts overlap, and mark them red", button: Button::Clash, keys: &[(K::C, true)], also: "", say: &["check interference", "interference", "interference check", "check for clashes", "do any parts overlap", "check overlaps"] },
     Command { id: "tool.move", label: "Move a part: drag it, let go on another part's face to set it there", button: Button::Move, keys: &[(K::M, true)], also: "", say: &["move", "move parts", "move a part", "move this"] },
     Command { id: "edit.handles", label: "Dimension handles on the model: drag one to change its size", button: Button::Handles, keys: &[(K::H, true)], also: "", say: &["handles", "dimension handles", "show the handles", "hide the handles"] },

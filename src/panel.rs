@@ -147,6 +147,7 @@ pub fn icon_of(b: Button) -> &'static Icon {
         Button::Handles => &icons::PUSH_PULL,
         Button::Move => &icons::RECENTRE,
         Button::Clash => &icons::SECTION,
+        Button::Radial => &icons::RECENTRE,
         Button::ConfirmGo => &icons::CHECK,
         Button::ConfirmStop => &icons::CLEAR,
         Button::CancelVoice => &icons::CLEAR,

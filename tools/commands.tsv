@@ -23,6 +23,7 @@ ui.keyboard	On-screen keyboard	keyboard
 ai.repeat	Repeat the last request	repeat|repeat that|again|do it again
 ai.keep	Keep the last request	keep that|save that request
 ai.saved	Saved requests	saved requests|show saved requests
+ui.radial	Radial menu at the pointing hand: move towards a choice, trigger to take it	menu|radial menu|open the menu
 tool.clash	Check which parts overlap, and mark them red	check interference|interference|interference check|check for clashes|do any parts overlap|check overlaps
 tool.move	Move a part: drag it, let go on another part's face to set it there	move|move parts|move a part|move this
 edit.handles	Dimension handles on the model: drag one to change its size	handles|dimension handles|show the handles|hide the handles
