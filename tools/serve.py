@@ -143,6 +143,58 @@ def export_scm():
     return publish(export_bytes())
 
 
+# --- SolidCraft's own exploded views: an assembly's saved views, shown one after another ---
+
+explode = {"view": None}  # the name of the view on show, None when assembled
+
+
+def explode_views():
+    """The design's exploded views as [(id, name)] (empty for a design without components or views)."""
+    try:
+        text, err = session.call("execute", {"command": "explode.list", "params": {}})
+        return [] if err else [(v["id"], v.get("name") or f"View {v['id']}") for v in json.loads(text).get("views", [])]
+    except (RuntimeError, ValueError):
+        return []
+
+
+def explode_show(name):
+    """Show the view called `name`, or the assembled design for None. Showing is not an edit: it leaves no
+    undo step, and the design's placements are kept."""
+    text, err = session.call("execute", {"command": "explode.show", "params": {"view": name} if name else {}})
+    if err:
+        raise RuntimeError(text[:160])
+    explode["view"] = name
+    export_scm()
+    return f"Exploded view: {name}." if name else "Assembled."
+
+
+def explode_next():
+    """The next view after the one on show, then the assembled design again."""
+    names = [n for _, n in explode_views()]
+    if not names:
+        return "This design has no exploded views."
+    order = names + [None]
+    return explode_show(order[(order.index(explode["view"]) + 1) % len(order)] if explode["view"] in order else names[0])
+
+
+def assembled():
+    """Before an edit: put the parts back where they are (an edit made in an exploded view would read
+    positions that are only on show)."""
+    if explode["view"] is not None:
+        try:
+            session.call("execute", {"command": "explode.show", "params": {}})
+        except RuntimeError:
+            pass
+        explode["view"] = None
+
+
+def explodes_text():
+    """For the headset, one view per line: id, name, 1 if on show."""
+    if session is None:
+        return b""
+    return "".join(f"{i}\t{n}\t{1 if n == explode['view'] else 0}\n" for i, n in explode_views()).encode()
+
+
 # --- preview: show what a change would give, and make it only when the wearer says so ---
 
 waiting = {"p": None}  # the change on show: {"label", "reply", "steps", "selected"}
@@ -964,6 +1016,7 @@ UNITS = {"mm": "", "millimeter": "", "millimetre": "", "cm": " cm", "centimeter"
 def set_dimension(dim, value, why=""):
     """Set one dimension (a number in its own unit, or an expression). (reply, changed). A value that breaks
     a feature is taken back."""
+    assembled()
     before = undo_depth()
     text, err = session.call("set_parameter", {"name": dim["id"], "value": value})
     log(f"direct: {dim['label']} ({dim['id']}) = {value!r}{why} -> {'ERROR ' if err else ''}{text[:160]}")
@@ -1050,6 +1103,7 @@ def est_tokens(obj):
 def ask(request_text, selected=(), pointed=None, faces=(), allow_confirm=True, edges=()):
     """Run one request through Claude with the session's tools; returns (reply, changed). When the context grows
     past --context-confirm the request waits (pending["st"] is set) for /ask/confirm; past --context-max it stops."""
+    assembled()
     key = api_key() if AI["backend"] == "anthropic" else "local"
     if not key:
         return ("No API key: run  security add-generic-password -a \"$USER\" -s scview-anthropic -w  on a Mac, or "
@@ -1250,9 +1304,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt"):
+        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt"):
             out = {"/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
-                   "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines}[self.path]()
+                   "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines, "/explodes.txt": explodes_text}[self.path]()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(out)))
@@ -1284,7 +1338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
-                             "/preview/apply", "/preview/cancel", "/visibility"):
+                             "/preview/apply", "/preview/cancel", "/visibility", "/explode"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1358,6 +1412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 dist = float(self.headers.get("X-Distance", "0"))
                 if not dist:
                     raise RuntimeError("No distance.")
+                assembled()
                 before = undo_depth()
                 # Press Pull moves a flat face (adds material outward, cuts inward); Offset Face as a fallback.
                 text, err = session.call("execute", {"command": "solid.press_pull",
@@ -1419,6 +1474,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        if self.path == "/explode":
+            # One of SolidCraft's exploded views: X-View is its name, "none" for the assembled design, or
+            # absent for the next one in turn.
+            reply = ""
+            try:
+                if session is None:
+                    raise RuntimeError("Exploded views need a STEP or .sc source.")
+                view = urllib.parse.unquote(self.headers.get("X-View", ""))
+                reply = explode_next() if not view else explode_show(None if view == "none" else view)
+            except RuntimeError as e:
+                reply = str(e)
+            log(f"explode: {reply}")
+            self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
+            return
         if self.path == "/visibility":
             # What the wearer has hidden, as a JSON list of body names in X-Hidden. Kept for the AI's summary;
             # with --sync-visibility SolidCraft's own browser is set to match (that is an undo step there).
@@ -1878,6 +1947,7 @@ def pick_source(path):
 
 def load(src):
     """Open or convert the source and publish it."""
+    explode["view"] = None  # a newly opened design is assembled
     global session
     ext = os.path.splitext(src)[1].lower()
     # A different model: the AI's undo and redo steps belonged to the last one.

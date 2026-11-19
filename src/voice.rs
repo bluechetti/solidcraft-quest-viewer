@@ -966,6 +966,31 @@ pub fn take_select() -> Option<Vec<String>> {
     SELECT_IN.lock().ok()?.take()
 }
 
+/// How many exploded views of its own the design has (SolidCraft's, for assemblies); 0 until known.
+static EXPLODES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn explode_views() -> u32 {
+    EXPLODES.load(Ordering::SeqCst)
+}
+
+/// Asks the Mac how many exploded views the design has (GET /explodes.txt), in the background.
+pub fn fetch_explodes() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/explodes.txt", 10) {
+            EXPLODES.store(String::from_utf8_lossy(&b).lines().filter(|l| !l.trim().is_empty()).count() as u32, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Shows the design's next exploded view, then the assembled design again (POST /explode).
+pub fn explode_next() {
+    std::thread::spawn(|| {
+        let r = post_typed("/explode", b"", "text/plain", 60, "");
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+    });
+}
+
 /// Tells the Mac which parts are hidden in the headset (POST /visibility), so the AI knows what the wearer
 /// cannot see. Sent when the set changes; nothing is shown for it.
 pub fn sync_hidden(names: Vec<String>) {

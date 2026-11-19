@@ -3235,6 +3235,7 @@ fn run(app: &Host) {
                 edge_cache = None;
                 log::info!("new model: {tris} triangles uploaded in {} ms", t.elapsed().as_millis());
                 voice::fetch_history();
+                voice::fetch_explodes();
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -4039,7 +4040,12 @@ fn run(app: &Host) {
                                 }
                             }
                             Button::Explode => {
-                                explode_target = Some(if explode > 0.01 { 0.0 } else { 1.0 });
+                                if voice::explode_views() > 0 {
+                                    // An assembly with exploded views of its own: SolidCraft's, one after another.
+                                    voice::explode_next();
+                                } else {
+                                    explode_target = Some(if explode > 0.01 { 0.0 } else { 1.0 });
+                                }
                             }
                             Button::Edges => {
                                 edges = match edges {
