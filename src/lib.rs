@@ -734,6 +734,17 @@ enum Guides {
     Grid,
 }
 
+/// A long dimensions list is shown in pages: (dimensions on a page, pages). A list that fits has one page; a
+/// longer one gives up its last row to "next page".
+fn dims_paging(total: usize) -> (usize, usize) {
+    if total <= MODELS_SHOWN {
+        (total.max(1), 1)
+    } else {
+        let per = MODELS_SHOWN - 1;
+        (per, total.div_ceil(per))
+    }
+}
+
 /// Width of each of the two targets (- and +) at the right end of a dimension's row.
 const DIM_ZONE: f32 = 0.022;
 
@@ -908,6 +919,8 @@ struct PanelState {
     kb_open: bool,
     /// Which page of the full reply is shown.
     reply_page: usize,
+    /// The page of the dimensions list on view.
+    dims_page: usize,
     overlay: Overlay,
     /// The overlay row the pointer is on.
     overlay_hover: Option<usize>,
@@ -1311,7 +1324,16 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
         let title = match overlay {
             Overlay::Keys => "Keyboard and mouse".to_string(),
             Overlay::Requests => "Saved requests (click to run, x removes)".to_string(),
-            Overlay::Dims => "Dimensions (click - or + to change, no AI)".to_string(),
+            Overlay::Dims => {
+                let total = dims.as_ref().map_or(0, |d| d.len());
+                let (per, pages) = dims_paging(total);
+                if pages > 1 {
+                    let first = st.dims_page.min(pages - 1) * per;
+                    format!("Dimensions {}-{} of {} (- or + changes one, no AI)", first + 1, (first + per).min(total), total)
+                } else {
+                    "Dimensions (click - or + to change, no AI)".to_string()
+                }
+            }
             Overlay::Reply => format!("Reply, page {}/{} (click: next page, Esc: close)", page + 1, pages),
             _ => "Open a model on the Mac (trigger / click)".to_string(),
         };
@@ -1366,7 +1388,17 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
                 None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
                 Some(list) if list.is_empty() => ui.text("Nothing to set: the design has no parameters or features", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
                 Some(list) => {
-                    for (i, d) in list.iter().take(MODELS_SHOWN).enumerate() {
+                    let (per, pages) = dims_paging(list.len());
+                    let page = st.dims_page.min(pages - 1);
+                    if pages > 1 {
+                        // The last row turns the page.
+                        let y = row_top(per);
+                        if overlay_hover == Some(per) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        ui.text_px(&format!("Page {} of {}: click here for the next", page + 1, pages), -hw + 0.01, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                    for (i, d) in list.iter().skip(page * per).take(per).enumerate() {
                         let y = row_top(i);
                         if overlay_hover == Some(i) {
                             ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
@@ -2704,6 +2736,7 @@ fn run(app: &Host) {
         let mut pushing = false;
         let mut overlay = Overlay::Off;
         let mut reply_page = 0usize;
+        let mut dims_page = 0usize;
         let mut guides = Guides::Off;
         let mut tab = panel::Tab::Select;
         let mut kb_shift = false;
@@ -3689,7 +3722,17 @@ fn run(app: &Host) {
                         }
                     } else if let (Some(i), Overlay::Dims) = (model_pick, overlay) {
                         // A dimension: the - and + at the right end change it by one step, on the Mac, with no AI.
-                        let d = voice::DIMS.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(i).cloned()));
+                        let total = voice::DIMS.lock().ok().and_then(|l| l.as_ref().map(|l| l.len())).unwrap_or(0);
+                        let (per, pages) = dims_paging(total);
+                        dims_page = dims_page.min(pages - 1);
+                        let d = if pages > 1 && i == per {
+                            // The last row of a long list: the next page.
+                            dims_page = (dims_page + 1) % pages;
+                            log::info!("dimensions: page {} of {pages}", dims_page + 1);
+                            None
+                        } else {
+                            voice::DIMS.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(dims_page * per + i).filter(|_| i < per).cloned()))
+                        };
                         if let Some(d) = d {
                             let side = PANEL_W / 2.0 - overlay_x;
                             let dir = if side < DIM_ZONE { 1.0 } else if side < DIM_ZONE * 2.0 { -1.0 } else { 0.0 };
@@ -3772,6 +3815,7 @@ fn run(app: &Host) {
                             Button::Dims => {
                                 overlay = if overlay == Overlay::Dims { Overlay::Off } else { Overlay::Dims };
                                 if overlay == Overlay::Dims {
+                                    dims_page = 0;
                                     if let Ok(mut d) = voice::DIMS.lock() {
                                         *d = None;
                                     }
@@ -4596,7 +4640,7 @@ fn run(app: &Host) {
                     let now = 1.6 * sc / longest_m;
                     SIZE_STEPS.iter().position(|&x| (now / x - 1.0).abs() < 0.05)
                 };
-                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, reply_page, overlay, overlay_hover };
+                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, reply_page, dims_page, overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
                 let ni = ui.indices.len().min(UI_MAX_INDICES) / 6 * 6;
@@ -4784,6 +4828,19 @@ mod dim_tests {
         assert_eq!(dim_step_to(62.0, 1.0), 65.0);
         assert_eq!(dim_step_to(62.0, -1.0), 60.0);
         assert_eq!(dim_step_to(0.3, 1.0), 0.32);
+    }
+
+    #[test]
+    fn a_long_list_is_paged_and_a_short_one_is_not() {
+        use super::{dims_paging, MODELS_SHOWN};
+        assert_eq!(dims_paging(0), (1, 1));
+        assert_eq!(dims_paging(6), (6, 1));
+        assert_eq!(dims_paging(MODELS_SHOWN), (MODELS_SHOWN, 1));
+        // One more than fits: the last row becomes "next page", so 13 to a page.
+        assert_eq!(dims_paging(MODELS_SHOWN + 1), (MODELS_SHOWN - 1, 2));
+        assert_eq!(dims_paging(23), (13, 2));
+        assert_eq!(dims_paging(26), (13, 2));
+        assert_eq!(dims_paging(27), (13, 3));
     }
 
     #[test]
