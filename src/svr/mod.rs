@@ -11,9 +11,12 @@
 //! What they give this viewer: one tested implementation of holding the model with one hand and
 //! scaling it with two, with the snap to real size, so a design handles the same way here and in
 //! the desktop app's VR mode.
+//!
+//! `precise.rs` is this viewer's own (not from the pull request): the slow, snapped drag every tool shares.
 #![allow(dead_code)]
 
 pub mod grab;
+pub mod precise;
 pub mod room;
 
 use vector::finite;

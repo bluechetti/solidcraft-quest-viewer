@@ -2849,6 +2849,8 @@ fn run(app: &Host) {
         let mut kb_panel_at: Option<[f32; 3]> = None;
         // Push/pull by mouse: steps so far, and when a wheel-only pull ends.
         let mut pp_acc = 0.0f32;
+        // The drag of a face by hand, from the trigger's press to its release (see svr::precise).
+        let mut pp_precise: Option<svr::precise::Drag> = None;
         let mut pp_wheel_until: Option<Instant> = None;
         'main: loop {
             #[cfg(not(target_os = "android"))]
@@ -3100,7 +3102,8 @@ fn run(app: &Host) {
                 held[h] = hand[h].is_some() && squeeze.state(&session, hand_paths[h]).map(|st| st.current_state > 0.6).unwrap_or(false);
             }
             let pos = |p: &xr::Posef| [p.position.x, p.position.y, p.position.z];
-            let grips = [0, 1].map(|h| if held[h] { hand[h].map(|p| svr_pose(&p)) } else { None });
+            // A hand that is dragging something (a face) does not also hold the model: its grip means "slowly".
+            let grips = [0, 1].map(|h| if held[h] && !(h == 1 && pp_drag.is_some()) { hand[h].map(|p| svr_pose(&p)) } else { None });
             if grips.iter().any(Option::is_some) {
                 // The whole model matrix (model units to the room's metres) is what the hands hold; the
                 // viewer keeps it as world * model_inner, so the result is taken apart again.
@@ -3341,7 +3344,9 @@ fn run(app: &Host) {
                 voice::MODELS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             };
             let ov_rows = overlay_rows(overlay, n_models);
-            let ctrl_pm: Option<M4> = if held[1] {
+            // No pointer from a hand that holds the model; a hand that is dragging a face keeps it (its grip
+            // then means "slowly").
+            let ctrl_pm: Option<M4> = if held[1] && pp_drag.is_none() {
                 None
             } else {
                 aim_space
@@ -3618,6 +3623,16 @@ fn run(app: &Host) {
                             continue;
                         }
                         typed.clear();
+                        // In push/pull, a number alone moves the face pointed at by exactly that many mm.
+                        if let (true, Some(b), Some(p), Ok(mm)) = (pushing, hovered, hit_point, text.trim_end_matches("mm").trim().parse::<f32>()) {
+                            if mm.abs() >= 0.5 {
+                                log::info!("push/pull {} by {mm} mm (typed)", scene.bodies[b].name);
+                                voice::push_pull(voice::pin_text(&scene.bodies[b].name, sub(p, off(b))), mm);
+                            } else {
+                                voice::say("SolidCraft moves a face by half a millimetre or more.");
+                            }
+                            continue;
+                        }
                         // Like speaking: the spot under the pointer goes with it ("make this red").
                         talk_point = match (hovered, hit_point) {
                             (Some(b), Some(p)) => Some((b, sub(p, off(b)))),
@@ -4237,8 +4252,14 @@ fn run(app: &Host) {
                     pp_acc += mouse.wheel;
                     *mm = pp_acc.round() * step;
                 } else if let Some((pm, _)) = ray {
-                    let moved_m = dot(sub([pm[12], pm[13], pm[14]], hand0), n_w);
-                    *mm = (moved_m / unit / step).round() * step;
+                    // The hand's move along the face's normal, in mm. With the same hand's grip held it counts
+                    // a tenth and lands on a finer step (svr::precise).
+                    let along = (dot(sub([pm[12], pm[13], pm[14]], hand0), n_w) / unit) as f64;
+                    let fine = held[1];
+                    let drag = pp_precise.get_or_insert_with(|| svr::precise::Drag::start(along, 0.0));
+                    let value = drag.update(along, fine);
+                    let s = if fine { svr::precise::fine_step(step as f64, 0.5) } else { step as f64 };
+                    *mm = svr::precise::snap(value, s) as f32;
                 }
                 if !trig && pp_wheel_until.map_or(true, |t| Instant::now() >= t) {
                     pp_wheel_until = None;
@@ -4248,6 +4269,7 @@ fn run(app: &Host) {
                         voice::push_pull(voice::pin_text(&scene.bodies[b].name, p), d);
                     }
                     pp_drag = None;
+                    pp_precise = None;
                 }
             }
             // Re-recording: in note mode, with one note selected and no new pin, the left trigger records new words for it.
