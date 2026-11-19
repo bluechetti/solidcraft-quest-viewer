@@ -724,6 +724,136 @@ pub struct Dim {
 /// The dimensions, once fetched (None: not yet).
 pub static DIMS: Mutex<Option<Vec<Dim>>> = Mutex::new(None);
 
+/// Only this feature's dimensions are listed ("" for all): set when a feature is picked in the feature tree.
+static DIMS_OF: Mutex<String> = Mutex::new(String::new());
+
+pub fn dims_of() -> String {
+    DIMS_OF.lock().map(|f| f.clone()).unwrap_or_default()
+}
+
+pub fn set_dims_of(feature: &str) {
+    if let Ok(mut f) = DIMS_OF.lock() {
+        *f = feature.to_string();
+    }
+}
+
+/// Moves a part on the Mac (POST /move, no AI). `onto`: the point it was taken hold of and the point on
+/// another part it was let go over, when it should be set on that face; else it moves by `by` (model units).
+pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3])>) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_status("Moving the part...", Some(""), Some(""));
+    std::thread::spawn(move || {
+        let p = |v: [f32; 3]| format!("{}\t{}\t{}", v[0], v[1], v[2]);
+        let extra = match onto {
+            Some((from, to)) => format!("X-Body: {}\r\nX-From: {}\r\nX-To: {}\r\n", percent(&body), percent(&p(from)), percent(&p(to))),
+            None => format!("X-Body: {}\r\nX-Translate: {}\r\n", percent(&body), percent(&p(by))),
+        };
+        match post_typed("/move", b"", "text/plain", 120, &extra) {
+            Ok(json) => {
+                if json.contains("\"changed\": true") {
+                    CHANGES.fetch_add(1, Ordering::SeqCst);
+                }
+                set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+            }
+            Err(e) => set_status("", None, Some(&e)),
+        }
+        BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// A dimension's handle on the model (GET /handles.txt): where it is, the way it moves, and what a move of
+/// one model unit adds to the value (2 for a diameter taken hold of at its rim).
+#[derive(Clone)]
+pub struct Handle {
+    pub id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: String,
+    pub at: [f32; 3],
+    pub dir: [f32; 3],
+    pub gain: f32,
+}
+
+/// The handles of the model on show (empty until fetched, or when the design has none).
+pub static HANDLES: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
+
+/// Fetches the dimension handles (GET /handles.txt) in the background.
+pub fn fetch_handles() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/handles.txt", 20) {
+            let list: Vec<Handle> = String::from_utf8_lossy(&b)
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split('\t').collect();
+                    if f.len() < 11 {
+                        return None;
+                    }
+                    let n = |i: usize| f[i].parse::<f32>().ok();
+                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)? })
+                })
+                .collect();
+            log::info!("handles: {} on the model", list.len());
+            if let Ok(mut h) = HANDLES.lock() {
+                *h = list;
+            }
+        }
+    });
+}
+
+/// A feature of the design's timeline (GET /features.txt).
+#[derive(Clone)]
+pub struct Feature {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub off: bool,
+    pub error: String,
+}
+
+/// The feature tree, once fetched (None: not yet).
+pub static FEATURES: Mutex<Option<Vec<Feature>>> = Mutex::new(None);
+
+/// Fetches the feature tree (GET /features.txt) in the background.
+pub fn fetch_features() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else {
+            say("The Mac isn't running serve.py (no beacon seen).");
+            return;
+        };
+        match crate::http_get(mac, "/features.txt", 10) {
+            Ok(b) => {
+                let list: Vec<Feature> = String::from_utf8_lossy(&b)
+                    .lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split('\t').collect();
+                        (f.len() >= 4).then(|| Feature { id: f[0].into(), name: f[1].into(), kind: f[2].into(), off: f[3] == "1", error: f.get(4).unwrap_or(&"").to_string() })
+                    })
+                    .collect();
+                if let Ok(mut d) = FEATURES.lock() {
+                    *d = Some(list);
+                }
+            }
+            Err(e) => say(&format!("Feature tree: {e}")),
+        }
+    });
+}
+
+/// Switches a feature off (suppressed) or on again (POST /feature, no AI): an undo step like any change.
+pub fn toggle_feature(id: &str) {
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let r = post_typed("/feature", b"", "text/plain", 60, &format!("X-Id: {}\r\n", percent(&id)));
+        if r.as_ref().is_ok_and(|json| json.contains("\"changed\": true")) {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+        }
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+        fetch_features();
+    });
+}
+
 /// Fetches the dimensions (GET /dimensions.txt) in the background.
 pub fn fetch_dims() {
     std::thread::spawn(|| {
@@ -733,8 +863,10 @@ pub fn fetch_dims() {
         };
         match crate::http_get(mac, "/dimensions.txt", 10) {
             Ok(b) => {
+                let only = dims_of();
                 let list: Vec<Dim> = String::from_utf8_lossy(&b)
                     .lines()
+                    .filter(|l| only.is_empty() || l.split('\t').nth(1).is_some_and(|label| label.strip_prefix(only.as_str()).is_some_and(|rest| rest.starts_with(' '))))
                     .filter_map(|l| {
                         let f: Vec<&str> = l.split('\t').collect();
                         let value = f.get(2)?.parse().ok()?;

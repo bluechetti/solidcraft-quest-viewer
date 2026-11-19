@@ -1057,6 +1057,163 @@ def direct_request(text):
     return set_dimension(dim, value, " (spoken)")
 
 
+# --- the feature tree: the design's features in order, each can be switched off and on ---
+
+def features():
+    """The timeline as [{"id", "name", "type", "suppressed", "error"}], in order."""
+    text, err = session.call("inspect_design", {"timeline": "summary", "bodies": False, "measure": False, "sketches": False})
+    if err:
+        raise RuntimeError(text[:200])
+    return [{"id": f.get("id"), "name": f.get("name") or f"Feature {f.get('id')}", "type": str(f.get("type", "")).replace("Feature", ""),
+             "suppressed": bool(f.get("suppressed")), "error": str(f.get("error") or "")} for f in json.loads(text).get("timeline", [])]
+
+
+def features_text():
+    """For the headset, one feature per line: id, name, type, 1 if switched off, its error if it has one."""
+    if session is None:
+        return b""
+    clean = lambda t: str(t).replace("\t", " ").replace("\n", " ")[:100]
+    try:
+        return "".join(f"{f['id']}\t{clean(f['name'])}\t{f['type']}\t{1 if f['suppressed'] else 0}\t{clean(f['error'])}\n" for f in features()).encode()
+    except (RuntimeError, ValueError):
+        return b""
+
+
+def set_suppressed(feature, off):
+    """Switch one feature off (suppressed) or on, as one undo step: (reply, changed). `off` None toggles."""
+    assembled()
+    fs = features()
+    f = next((x for x in fs if str(x["id"]) == str(feature) or x["name"].lower() == str(feature).lower()), None)
+    if f is None:
+        return f"No feature is called \"{feature}\".", False
+    off = (not f["suppressed"]) if off is None else off
+    if off == f["suppressed"]:
+        return f"{f['name']} is already {'off' if off else 'on'}.", False
+    before = undo_depth()
+    text, err = session.call("execute", {"command": "timeline.suppress", "params": {"feature": f["id"], "suppressed": off}})
+    log(f"feature {f['name']} ({f['id']}) {'off' if off else 'on'} -> {'ERROR ' if err else ''}{text[:140]}")
+    if err:
+        return f"SolidCraft refused: {text[:120]}", False
+    label = f"{f['name']} {'off' if off else 'on'}"
+    ai_redo.clear()
+    if before is not None:
+        ai_undo.append((before, label))
+    broken = [x["name"] for x in features() if x["error"] and not x["suppressed"]]
+    return (f"{f['name']} is {'off' if off else 'on'}." + (f" Now failing: {', '.join(broken)[:80]}." if broken else "")), True
+
+
+# --- moving a part: by a distance, or onto a face of another part ---
+
+def move_body(body, translate=None, frm=None, to=None):
+    """Move one body, as one undo step: (reply, changed). With `frm` and `to` (model points: where the part
+    was taken hold of, and where on another part it was let go) the part is set there with SolidCraft's
+    align: the face it was held by onto the face pointed at, or the point onto the point when the part was
+    not held by a flat face. Else it moves by `translate`."""
+    assembled()
+    if body not in all_body_names():
+        return f"No part is called \"{body}\".", False
+    before = undo_depth()
+    if frm and to:
+        text, err = session.call("execute", {"command": "solid.align", "params": {"bodies": [body], "from_face": frm, "to_face": to}})
+        how = "face to face"
+        if err:
+            text, err = session.call("execute", {"command": "solid.align", "params": {"bodies": [body], "from": frm, "to": to}})
+            how = "point to point"
+        label = f"set {body} on another part"
+        reply = f"{body} set there ({how})."
+    else:
+        t = [round(float(x), 4) for x in translate]
+        text, err = session.call("execute", {"command": "solid.move", "params": {"bodies": [body], "translate": t}})
+        label = f"move {body} by {t}"
+        reply = f"{body} moved by {t[0]:g}, {t[1]:g}, {t[2]:g} mm."
+    log(f"{label} -> {'ERROR ' if err else ''}{text[:140]}")
+    if err:
+        return f"SolidCraft could not move {body}: {text[:120]}", False
+    ai_redo.clear()
+    if before is not None:
+        ai_undo.append((before, label))
+    return reply, True
+
+
+# --- dimension handles: where on the model each dimension can be taken hold of ---
+
+def handles():
+    """A handle for each dimension that has an obvious place on the model: a box's three sizes (the middle of
+    its +X, +Y and +Z faces), a cylinder's height (its far end) and radius (its side), a hole's diameter
+    (its rim). Each is {"id", "label", "value", "unit", "at" (model point), "dir" (unit vector the handle
+    moves along), "gain" (what a move of 1 adds to the value: 2 for a diameter), "body"}.
+    The id is what set_dimension takes: the user parameter when the feature's size is just that parameter
+    (so the design stays driven by it, and everything else that uses it follows), else the feature's own."""
+    dims = {d["id"]: d for d in dimensions()}
+    users = {d["id"] for d in dims.values() if d["kind"] == "user"}
+    boxes = {b["name"]: b["bbox"] for b in json.loads(session.call("measure", {"summary": True})[0]).get("bodies", [])}
+    out = []
+    add = lambda v, w, k=1.0: [a + k * b for a, b in zip(v, w)]
+    for f in features():
+        if f["suppressed"] or f["error"]:
+            continue
+        text, err = session.call("execute", {"command": "timeline.inspect", "params": {"feature": f["id"]}})
+        if err:
+            continue
+        info = json.loads(text)
+        d = info.get("definition", {})
+        inputs = {i["label"]: i for i in info.get("inputs", [])}
+
+        def handle(label, at, direction, gain=1.0, body=None):
+            i = inputs.get(label)
+            if not i or i["param"] not in dims:
+                return
+            own = dims[i["param"]]
+            driven_by = i["expression"].strip() if i["expression"].strip() in users else None
+            target = dims[driven_by] if driven_by else own
+            out.append({"id": target["id"], "label": f"{f['name']} {label}" + (f" ({driven_by})" if driven_by else ""), "value": own["value"],
+                        "unit": own["unit"], "at": [round(x, 4) for x in at], "dir": direction, "gain": gain, "body": body or ""})
+
+        kind = info.get("type")
+        body = (d.get("body_names") or d.get("participants") or [None])[0]
+        bb = boxes.get(body)
+        if kind == "box" and bb:
+            lo, hi = bb["min"], bb["max"]
+            mid = [(a + b) / 2 for a, b in zip(lo, hi)]
+            for k, label in enumerate(("Length", "Width", "Height")):
+                at = list(mid)
+                at[k] = hi[k]
+                handle(label, at, [1.0 if j == k else 0.0 for j in range(3)], 1.0, body)
+        elif kind == "cylinder" and bb:
+            axis = [float(x) for x in d.get("axis", [0, 0, 1])]
+            k = max(range(3), key=lambda j: abs(axis[j]))      # the model axis it stands along
+            lo, hi = bb["min"], bb["max"]
+            mid = [(a + b) / 2 for a, b in zip(lo, hi)]
+            top = list(mid)
+            top[k] = hi[k] if axis[k] > 0 else lo[k]
+            handle("Height", top, [(1.0 if axis[k] > 0 else -1.0) if j == k else 0.0 for j in range(3)], 1.0, body)
+            side = (k + 1) % 3
+            at = list(mid)
+            at[side] = hi[side]
+            handle("Radius", at, [1.0 if j == side else 0.0 for j in range(3)], 1.0, body)
+        elif kind == "hole":
+            pos = d.get("position")
+            direction = [float(x) for x in d.get("direction", [0, 0, -1])]
+            if isinstance(pos, list) and all(isinstance(x, (int, float)) for x in pos) and "Diameter" in inputs and inputs["Diameter"]["param"] in dims:
+                k = max(range(3), key=lambda j: abs(direction[j]))
+                side = (k + 1) % 3
+                perp = [1.0 if j == side else 0.0 for j in range(3)]
+                handle("Diameter", add(pos, perp, dims[inputs["Diameter"]["param"]]["value"] / 2), perp, 2.0, body)
+    return out
+
+
+def handles_text():
+    """For the headset, one handle per line: id, label, value, unit, at x y z, dir x y z, gain, body (tabs)."""
+    if session is None:
+        return b""
+    try:
+        return "".join("\t".join([h["id"], h["label"], f"{h['value']:g}", h["unit"], *(f"{x:g}" for x in h["at"]), *(f"{x:g}" for x in h["dir"]),
+                                  f"{h['gain']:g}", h["body"]]) + "\n" for h in handles()).encode()
+    except (RuntimeError, ValueError, KeyError) as e:
+        log(f"handles: {e}")
+        return b""
+
+
 def history_text_lines():
     """For the headset: what Undo and Redo would do next, newest first. One per line: "u" or "r", then the
     change's words ("thickness = 12", "push/pull +5 mm", or the request as it was heard)."""
@@ -1304,8 +1461,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt"):
-            out = {"/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
+        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt", "/features.txt", "/handles.txt"):
+            out = {"/handles.txt": handles_text, "/features.txt": features_text, "/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
                    "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines, "/explodes.txt": explodes_text}[self.path]()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1338,7 +1495,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
-                             "/preview/apply", "/preview/cancel", "/visibility", "/explode"):
+                             "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1474,6 +1631,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        if self.path == "/move":
+            # Move a part. X-Body: its name; X-Translate: "dx\tdy\tdz" in model units, or X-From and X-To
+            # ("x\ty\tz" each): the point it was held by and the point on another part to set it on.
+            reply, changed = "", False
+            try:
+                if session is None:
+                    raise RuntimeError("Moving parts needs a STEP or .sc source.")
+                vec = lambda name: [float(v) for v in urllib.parse.unquote(self.headers.get(name, "")).split("\t")] if self.headers.get(name) else None
+                body = urllib.parse.unquote(self.headers.get("X-Body", ""))
+                reply, changed = move_body(body, vec("X-Translate"), vec("X-From"), vec("X-To"))
+                if changed:
+                    export_scm()
+            except (RuntimeError, ValueError) as e:
+                reply = f"Bad move request: {e}"
+            self.reply_json({"heard": "", "reply": reply, "ok": changed, "changed": changed})
+            return
+        if self.path == "/feature":
+            # Switch a feature off or on. X-Id: its id or name; X-Suppress: 1 (off), 0 (on), or absent to toggle.
+            reply, changed = "", False
+            try:
+                if session is None:
+                    raise RuntimeError("The feature tree needs a STEP or .sc source.")
+                want = self.headers.get("X-Suppress", "")
+                reply, changed = set_suppressed(urllib.parse.unquote(self.headers.get("X-Id", "")), {"1": True, "0": False}.get(want))
+                if changed:
+                    export_scm()
+            except (RuntimeError, ValueError) as e:
+                reply = str(e)
+            self.reply_json({"heard": "", "reply": reply, "ok": changed, "changed": changed})
+            return
         if self.path == "/explode":
             # One of SolidCraft's exploded views: X-View is its name, "none" for the assembled design, or
             # absent for the next one in turn.

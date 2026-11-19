@@ -54,6 +54,9 @@ pub const COMMANDS: &[Command] = &[
     Command { id: "ai.repeat", label: "Repeat the last request", button: Button::Repeat, keys: &[(K::T, false)], also: "", say: &["repeat", "repeat that", "again", "do it again"] },
     Command { id: "ai.keep", label: "Keep the last request", button: Button::SaveReq, keys: &[(K::W, false)], also: "", say: &["keep that", "save that request"] },
     Command { id: "ai.saved", label: "Saved requests", button: Button::Saved, keys: &[(K::Q, false)], also: "", say: &["saved requests", "show saved requests"] },
+    Command { id: "tool.move", label: "Move a part: drag it, let go on another part's face to set it there", button: Button::Move, keys: &[(K::M, true)], also: "", say: &["move", "move parts", "move a part", "move this"] },
+    Command { id: "edit.handles", label: "Dimension handles on the model: drag one to change its size", button: Button::Handles, keys: &[(K::H, true)], also: "", say: &["handles", "dimension handles", "show the handles", "hide the handles"] },
+    Command { id: "edit.features", label: "Feature tree: switch a feature off or on, or edit it", button: Button::Features, keys: &[(K::C, false)], also: "", say: &["features", "feature tree", "show the features", "timeline"] },
     Command { id: "edit.dimensions", label: "Dimensions: change a size directly", button: Button::Dims, keys: &[(K::V, false)], also: "", say: &["dimensions", "show dimensions", "show the dimensions"] },
 ];
 
@@ -131,7 +134,8 @@ mod tests {
         assert_eq!(by_key(K::S, false), Some(Button::Section));
         assert_eq!(by_key(K::S, true), Some(Button::SaveFile));
         // Shift with a key that has no shifted binding does the plain one.
-        assert_eq!(by_key(K::H, true), Some(Button::Hide));
+        assert_eq!(by_key(K::I, true), Some(Button::Isolate));
+        assert_eq!(by_key(K::H, true), Some(Button::Handles));
         assert_eq!(by_id("view.hide"), Some(Button::Hide));
         assert_eq!(by_id("nothing.like.this"), None);
         assert_eq!(shortcut(Button::Hide), "Ctrl+H or Del");

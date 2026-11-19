@@ -722,6 +722,9 @@ enum Button {
     SaveReq,
     Saved,
     Dims,
+    Features,
+    Handles,
+    Move,
     ConfirmGo,
     ConfirmStop,
     CancelVoice,
@@ -781,6 +784,7 @@ enum Overlay {
     Models,
     Requests,
     Dims,
+    Features,
     Reply,
 }
 
@@ -835,7 +839,7 @@ fn overlay_rows(ov: Overlay, models: usize) -> usize {
     match ov {
         Overlay::Off => 0,
         Overlay::Keys => KEY_HELP.len(),
-        Overlay::Models | Overlay::Requests | Overlay::Dims => models.clamp(1, MODELS_SHOWN),
+        Overlay::Models | Overlay::Requests | Overlay::Dims | Overlay::Features => models.clamp(1, MODELS_SHOWN),
         Overlay::Reply => REPLY_ROWS,
     }
 }
@@ -926,8 +930,13 @@ struct PanelState {
     undo_what: &'static str,
     redo_what: &'static str,
     reply_page: usize,
-    /// The page of the dimensions list on view.
+    /// The page of the dimensions list, and of the feature tree, on view.
     dims_page: usize,
+    feat_page: usize,
+    /// The dimension handles are on show.
+    handles: bool,
+    /// The trigger moves parts.
+    moving: bool,
     overlay: Overlay,
     /// The overlay row the pointer is on.
     overlay_hover: Option<usize>,
@@ -974,6 +983,24 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Keep (save) the last request to repeat"
             }
         }
+        Button::Move => match (st.moving, short) {
+            (true, true) => "Stop move",
+            (false, true) => "Move",
+            (true, false) => "Stop moving parts",
+            (false, false) => "Move a part: drag it; let go on another part's face to set it there",
+        },
+        Button::Handles => match (st.handles, short) {
+            (true, true) => "No handles",
+            (false, true) => "Handles",
+            (true, false) => "Hide the dimension handles",
+            (false, false) => "Dimension handles: drag one on the model to change its size",
+        },
+        Button::Features => match (overlay == Overlay::Features, short) {
+            (true, true) => "Close",
+            (false, true) => "Features",
+            (true, false) => "Close the feature tree",
+            (false, false) => "Feature tree: switch a feature off or on, or edit it",
+        },
         Button::Dims => match (overlay == Overlay::Dims, short) {
             (true, true) => "Close",
             (false, true) => "Dims",
@@ -1171,6 +1198,9 @@ fn active(b: Button, st: &PanelState) -> bool {
         Button::Keys => st.overlay == Overlay::Keys,
         Button::Saved => st.overlay == Overlay::Requests,
         Button::Dims => st.overlay == Overlay::Dims,
+        Button::Features => st.overlay == Overlay::Features,
+        Button::Handles => st.handles,
+        Button::Move => st.moving,
         Button::Reply => st.overlay == Overlay::Reply,
         Button::Keyboard => st.kb_open,
         Button::Section => st.section == Section::Moving,
@@ -1314,9 +1344,11 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
         let models = voice::MODELS.lock().ok().and_then(|m| m.clone());
         let requests = voice::REQUESTS.lock().ok().and_then(|m| m.clone());
         let dims = voice::DIMS.lock().ok().and_then(|m| m.clone());
+        let feats = voice::FEATURES.lock().ok().and_then(|m| m.clone());
         let count = match overlay {
             Overlay::Requests => requests.as_ref().map_or(0, |m| m.len()),
             Overlay::Dims => dims.as_ref().map_or(0, |m| m.len()),
+            Overlay::Features => feats.as_ref().map_or(0, |m| m.len()),
             _ => models.as_ref().map_or(0, |m| m.len()),
         };
         let rows = overlay_rows(overlay, count);
@@ -1335,8 +1367,20 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
                 if pages > 1 {
                     let first = st.dims_page.min(pages - 1) * per;
                     format!("Dimensions {}-{} of {} (- or + changes one, no AI)", first + 1, (first + per).min(total), total)
+                } else if !voice::dims_of().is_empty() {
+                    format!("Dimensions of {} (- or + changes one, no AI)", voice::dims_of())
                 } else {
                     "Dimensions (click - or + to change, no AI)".to_string()
+                }
+            }
+            Overlay::Features => {
+                let total = feats.as_ref().map_or(0, |d| d.len());
+                let (per, pages) = dims_paging(total);
+                if pages > 1 {
+                    let first = st.feat_page.min(pages - 1) * per;
+                    format!("Features {}-{} of {} (click one for its sizes, on/off at the right)", first + 1, (first + per).min(total), total)
+                } else {
+                    "Features (click one for its sizes, on/off at the right)".to_string()
                 }
             }
             Overlay::Reply => format!("Reply, page {}/{} (click: next page, Esc: close)", page + 1, pages),
@@ -1389,6 +1433,37 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
                 }
                 }
             }
+            Overlay::Features => match &feats {
+                None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) if list.is_empty() => ui.text("This design has no features (an imported model)", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) => {
+                    let (per, pages) = dims_paging(list.len());
+                    let page = st.feat_page.min(pages - 1);
+                    if pages > 1 {
+                        let y = row_top(per);
+                        if overlay_hover == Some(per) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        ui.text_px(&format!("Page {} of {}: click here for the next", page + 1, pages), -hw + 0.01, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                    for (i, f) in list.iter().skip(page * per).take(per).enumerate() {
+                        let y = row_top(i);
+                        if overlay_hover == Some(i) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        // The target at the right end switches the feature off or on; it says which it is now.
+                        let (word, colour) = if f.off { ("off", [150, 60, 60]) } else { ("on", [40, 110, 70]) };
+                        ui.quad(hw - DIM_ZONE * 2.0, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0006, colour);
+                        ui.text_px(word, hw - DIM_ZONE * 1.4, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        let kind = if f.error.is_empty() { f.kind.clone() } else { format!("{} (failing)", f.kind) };
+                        let kw = Ui::text_width_px(&kind, OV_PICK_FP);
+                        let right = hw - DIM_ZONE * 2.0 - 0.006;
+                        let name_colour = if f.off { [110, 125, 145] } else if f.error.is_empty() { [235, 240, 250] } else { [240, 150, 80] };
+                        ui.text_px(&Ui::fit(&f.name, (right + hw - 0.02 - kw) * FONT_PX / OV_PICK_FP), -hw + 0.01, y - 0.001, 0.001, name_colour, OV_PICK_FP);
+                        ui.text_px(&kind, right - kw, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                }
+            },
             Overlay::Dims => match &dims {
                 None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
                 Some(list) if list.is_empty() => ui.text("Nothing to set: the design has no parameters or features", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
@@ -2764,6 +2839,20 @@ fn run(app: &Host) {
         let mut overlay = Overlay::Off;
         let mut reply_page = 0usize;
         let mut dims_page = 0usize;
+        let mut feat_page = 0usize;
+        // Dimension handles: arrows on the model, one for each dimension that has a place there. The trigger
+        // on one takes hold of it; the hand's move along the arrow changes the value (slowly with the grip,
+        // see svr::precise), and letting go sends it to the Mac. The drag: the handle, the drag so far, the
+        // hand's place and the arrow's direction in the room when it began, and the value now.
+        // Moving a part: in this mode the trigger takes hold of the part pointed at and it follows the hand
+        // (slowly with the grip, see svr::precise). Let go over another part and it is set on the face
+        // pointed at there; let go over nothing and it stays where it was moved to. The drag: the part, the
+        // point it was taken by (model units), the hand's place in the room then, and the move so far.
+        let mut moving = false;
+        let mut move_drag: Option<(usize, [f32; 3], [f32; 3], [svr::precise::Drag; 3], [f32; 3])> = None;
+        let mut handles_on = false;
+        let mut handle_hover: Option<usize>;
+        let mut handle_drag: Option<(usize, svr::precise::Drag, [f32; 3], [f32; 3], f32)> = None;
         let mut guides = Guides::Off;
         let mut tab = panel::Tab::Select;
         let mut kb_shift = false;
@@ -3103,7 +3192,7 @@ fn run(app: &Host) {
             }
             let pos = |p: &xr::Posef| [p.position.x, p.position.y, p.position.z];
             // A hand that is dragging something (a face) does not also hold the model: its grip means "slowly".
-            let grips = [0, 1].map(|h| if held[h] && !(h == 1 && pp_drag.is_some()) { hand[h].map(|p| svr_pose(&p)) } else { None });
+            let grips = [0, 1].map(|h| if held[h] && !(h == 1 && (pp_drag.is_some() || handle_drag.is_some() || move_drag.is_some())) { hand[h].map(|p| svr_pose(&p)) } else { None });
             if grips.iter().any(Option::is_some) {
                 // The whole model matrix (model units to the room's metres) is what the hands hold; the
                 // viewer keeps it as world * model_inner, so the result is taken apart again.
@@ -3239,6 +3328,7 @@ fn run(app: &Host) {
                 log::info!("new model: {tris} triangles uploaded in {} ms", t.elapsed().as_millis());
                 voice::fetch_history();
                 voice::fetch_explodes();
+                voice::fetch_handles();
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -3255,6 +3345,15 @@ fn run(app: &Host) {
                 scene.bodies.iter().map(|b| [0, 1, 2].map(|k| ((b.aabb[k] + b.aabb[k + 3]) * 0.5 - c[k]) * explode)).collect()
             } else {
                 Vec::new()
+            };
+            // A part being moved is drawn (and picked) where the hand has taken it.
+            let offsets = match &move_drag {
+                Some((b, _, _, _, by)) if *b < scene.bodies.len() => {
+                    let mut o = if offsets.is_empty() { vec![[0.0f32; 3]; scene.bodies.len()] } else { offsets };
+                    o[*b] = [0, 1, 2].map(|k| o[*b][k] + by[k]);
+                    o
+                }
+                _ => offsets,
             };
             let off = |b: usize| offsets.get(b).copied().unwrap_or([0.0; 3]);
 
@@ -3338,6 +3437,8 @@ fn run(app: &Host) {
             let mut overlay_x = 0.0f32;
             let n_models = if overlay == Overlay::Requests {
                 voice::REQUESTS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
+            } else if overlay == Overlay::Features {
+                voice::FEATURES.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             } else if overlay == Overlay::Dims {
                 voice::DIMS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             } else {
@@ -3346,7 +3447,7 @@ fn run(app: &Host) {
             let ov_rows = overlay_rows(overlay, n_models);
             // No pointer from a hand that holds the model; a hand that is dragging a face keeps it (its grip
             // then means "slowly").
-            let ctrl_pm: Option<M4> = if held[1] && pp_drag.is_none() {
+            let ctrl_pm: Option<M4> = if held[1] && pp_drag.is_none() && handle_drag.is_none() && move_drag.is_none() {
                 None
             } else {
                 aim_space
@@ -3448,7 +3549,7 @@ fn run(app: &Host) {
                                     on_panel = true;
                                     overlay_click = true;
                                     len = t;
-                                    if matches!(overlay, Overlay::Models | Overlay::Requests | Overlay::Dims) && n_models > 0 {
+                                    if matches!(overlay, Overlay::Models | Overlay::Requests | Overlay::Dims | Overlay::Features) && n_models > 0 {
                                         overlay_hover = overlay_row_at(overlay, y, ov_rows, lay.h);
                                         overlay_x = x;
                                         overlay_del = overlay == Overlay::Requests && x > PANEL_W / 2.0 - 0.025;
@@ -3461,7 +3562,20 @@ fn run(app: &Host) {
                             let t0 = Instant::now();
                             // d is the world unit direction mapped into the model, so t is in metres.
                             let (o_m, d_m) = (transform(&inv, o_w, 1.0), transform(&inv, d_w, 0.0));
-                            let hit = scene.pick(o_m, d_m, &hidden, cut, &offsets);
+                            // The pointer looks past a part that is being moved, to what it would be set on.
+                            let moving_hidden;
+                            let pickable = match &move_drag {
+                                Some((b, ..)) if *b < hidden.len() => {
+                                    moving_hidden = {
+                                        let mut h = hidden.clone();
+                                        h[*b] = true;
+                                        h
+                                    };
+                                    &moving_hidden
+                                }
+                                _ => &hidden,
+                            };
+                            let hit = scene.pick(o_m, d_m, pickable, cut, &offsets);
                             pick_ms_sum += t0.elapsed().as_secs_f64() * 1000.0;
                             hovered = hit.map(|(b, _, _)| b);
                             if let Some((_, _, tri)) = hit {
@@ -3704,7 +3818,103 @@ fn run(app: &Host) {
                 let pages = (reply_lines().len() + REPLY_ROWS - 1) / REPLY_ROWS;
                 reply_page = if pages == 0 { 0 } else { (reply_page + 1) % pages };
             }
-            if (trig && !trigger_was) || key_btn.is_some() {
+            // Dimension handles: which one the pointer is on, the drag of one, and the press that starts it.
+            let handle_list = if handles_on { voice::HANDLES.lock().map(|h| h.clone()).unwrap_or_default() } else { Vec::new() };
+            let handle_len = 0.05 / unit; // the arrow's length, in model units (5 cm in the room)
+            handle_hover = None;
+            if let (Some((pm, _)), None, false, false) = (ray, &handle_drag, on_panel, on_kb) {
+                let (o, d) = ([pm[12], pm[13], pm[14]], normalize([-pm[8], -pm[9], -pm[10]]));
+                let mut best = 0.03f32; // the pointer within 3 cm of the arrow's head
+                for (i, h) in handle_list.iter().enumerate() {
+                    let tip = transform(&model, [0, 1, 2].map(|k| h.at[k] + h.dir[k] * handle_len), 1.0);
+                    let v = sub(tip, o);
+                    let t = dot(v, d);
+                    let off_ray = sub(v, d.map(|x| x * t));
+                    let dist = dot(off_ray, off_ray).sqrt();
+                    if t > 0.0 && dist < best {
+                        best = dist;
+                        handle_hover = Some(i);
+                    }
+                }
+            }
+            if let Some((i, ref mut drag, hand0, dir_w, ref mut value)) = handle_drag {
+                match (handle_list.get(i), ray) {
+                    (Some(h), Some((pm, _))) => {
+                        let along = (dot(sub([pm[12], pm[13], pm[14]], hand0), dir_w) / unit) as f64;
+                        let fine = held[1];
+                        let step = pp_step(unit) as f64;
+                        let moved = svr::precise::snap(drag.update(along, fine), if fine { svr::precise::fine_step(step, 0.1) } else { step });
+                        let now = (h.value + h.gain * moved as f32).max(0.1);
+                        if (now - *value).abs() > 1e-4 {
+                            *value = now;
+                            voice::say(&format!("{}: {} {}", h.label, fmt_dim(now), h.unit));
+                        }
+                        if !trig {
+                            if (now - h.value).abs() > 1e-4 {
+                                log::info!("handle {} ({}): {} -> {}", h.label, h.id, h.value, now);
+                                voice::set_dim(&h.id, now);
+                            }
+                            handle_drag = None;
+                        }
+                    }
+                    _ => {
+                        if !trig {
+                            handle_drag = None;
+                        }
+                    }
+                }
+            }
+            // Moving a part: the move so far, and the release.
+            if let Some((b, grab, hand0, ref mut drags, ref mut by)) = move_drag {
+                if let Some((pm, _)) = ray {
+                    let inv = invert(&model);
+                    let d_m = transform(&inv, sub([pm[12], pm[13], pm[14]], hand0), 0.0);
+                    let fine = held[1];
+                    let step = pp_step(unit) as f64;
+                    let step = if fine { svr::precise::fine_step(step, 0.1) } else { step };
+                    let mut now = [0, 1, 2].map(|k| svr::precise::snap(drags[k].update(d_m[k] as f64, fine), step) as f32);
+                    // Nearly along one of the model's axes: exactly along it.
+                    let big = now.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    if big > 0.0 {
+                        for v in now.iter_mut() {
+                            if v.abs() < 0.2 * big {
+                                *v = 0.0;
+                            }
+                        }
+                    }
+                    *by = now;
+                }
+                if !trig {
+                    let by = *by;
+                    let name = scene.bodies.get(b).map(|x| x.name.clone()).unwrap_or_default();
+                    match (hovered.filter(|&t| t != b), hit_point) {
+                        (Some(t), Some(p)) => {
+                            log::info!("move {name}: set on {} at {:?}", scene.bodies[t].name, sub(p, off(t)));
+                            voice::move_part(name, by, Some((grab, sub(p, off(t)))));
+                        }
+                        _ if by.iter().any(|v| v.abs() > 1e-4) => {
+                            log::info!("move {name}: by {by:?} mm");
+                            voice::move_part(name, by, None);
+                        }
+                        _ => {}
+                    }
+                    move_drag = None;
+                }
+            }
+            let move_click = trig && !trigger_was && key_btn.is_none() && moving && move_drag.is_none() && !on_panel && !on_kb && hovered.is_some() && hit_point.is_some();
+            if let (true, Some(b), Some(p), Some((pm, _))) = (move_click, hovered, hit_point, ray) {
+                move_drag = Some((b, sub(p, off(b)), [pm[12], pm[13], pm[14]], [svr::precise::Drag::start(0.0, 0.0); 3], [0.0; 3]));
+                log::info!("move {}: taken hold of", scene.bodies[b].name);
+            }
+            let handle_click = trig && !trigger_was && key_btn.is_none() && handle_drag.is_none() && handle_hover.is_some() && !move_click;
+            if let (true, Some(i), Some((pm, _))) = (handle_click, handle_hover, ray) {
+                if let Some(h) = handle_list.get(i) {
+                    let dir_w = normalize(transform(&model, h.dir, 0.0));
+                    handle_drag = Some((i, svr::precise::Drag::start(0.0, 0.0), [pm[12], pm[13], pm[14]], dir_w, h.value));
+                    log::info!("handle {}: taken hold of at {}", h.label, h.value);
+                }
+            }
+            if ((trig && !trigger_was) && !handle_click && handle_drag.is_none() && !move_click && move_drag.is_none()) || key_btn.is_some() {
                 if let (true, None) = (on_kb, key_btn) {
                     // The on-screen keyboard: a key types into the request line; the bar is taken hold of to move it.
                     match kb_hover {
@@ -3760,6 +3970,30 @@ fn run(app: &Host) {
                                 log::info!("saved request: {}", r.text);
                                 voice::run_saved(r.text);
                                 overlay = Overlay::Off;
+                            }
+                        }
+                    } else if let (Some(i), Overlay::Features) = (model_pick, overlay) {
+                        // A feature: the target at the right switches it off or on; the rest of the row opens its
+                        // dimensions.
+                        let total = voice::FEATURES.lock().ok().and_then(|l| l.as_ref().map(|l| l.len())).unwrap_or(0);
+                        let (per, pages) = dims_paging(total);
+                        feat_page = feat_page.min(pages - 1);
+                        if pages > 1 && i == per {
+                            feat_page = (feat_page + 1) % pages;
+                            log::info!("features: page {} of {pages}", feat_page + 1);
+                        } else if let Some(f) = voice::FEATURES.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(feat_page * per + i).filter(|_| i < per).cloned())) {
+                            if PANEL_W / 2.0 - overlay_x < DIM_ZONE * 2.0 {
+                                log::info!("feature {} ({}): switch {}", f.name, f.id, if f.off { "on" } else { "off" });
+                                voice::toggle_feature(&f.id);
+                            } else {
+                                log::info!("feature {} ({}): its dimensions", f.name, f.id);
+                                voice::set_dims_of(&f.name);
+                                overlay = Overlay::Dims;
+                                dims_page = 0;
+                                if let Ok(mut d) = voice::DIMS.lock() {
+                                    *d = None;
+                                }
+                                voice::fetch_dims();
                             }
                         }
                     } else if let (Some(i), Overlay::Dims) = (model_pick, overlay) {
@@ -3854,9 +4088,32 @@ fn run(app: &Host) {
                             Button::ConfirmStop => voice::cancel_confirm(),
                             Button::Repeat => voice::repeat_last(),
                             Button::SaveReq => voice::save_last(),
+                            Button::Move => {
+                                moving = !moving;
+                                if moving {
+                                    voice::say("Move: hold the trigger on a part and move your hand. Let go on another part to set it there.");
+                                }
+                            }
+                            Button::Handles => {
+                                handles_on = !handles_on;
+                                if handles_on {
+                                    voice::fetch_handles();
+                                }
+                            }
+                            Button::Features => {
+                                overlay = if overlay == Overlay::Features { Overlay::Off } else { Overlay::Features };
+                                if overlay == Overlay::Features {
+                                    feat_page = 0;
+                                    if let Ok(mut d) = voice::FEATURES.lock() {
+                                        *d = None;
+                                    }
+                                    voice::fetch_features();
+                                }
+                            }
                             Button::Dims => {
                                 overlay = if overlay == Overlay::Dims { Overlay::Off } else { Overlay::Dims };
                                 if overlay == Overlay::Dims {
+                                    voice::set_dims_of("");
                                     dims_page = 0;
                                     if let Ok(mut d) = voice::DIMS.lock() {
                                         *d = None;
@@ -4346,6 +4603,18 @@ fn run(app: &Host) {
             let push_for = |m: &M4, tint: [f32; 4]| push_for_cut(m, tint, NO_PLANE);
             // Extra bars drawn with the ray box (world matrices): the outline of the cut, measure points and line.
             let mut bars: Vec<(M4, [f32; 4])> = Vec::new();
+            // Dimension handles: a thin shaft out of the model and a block at its end. The one pointed at is
+            // light blue; the one being dragged is green and drawn where the value now puts it.
+            for (i, h) in handle_list.iter().enumerate() {
+                let dragged = handle_drag.as_ref().filter(|d| d.0 == i).map(|d| (d.4 - h.value) / h.gain.max(1e-6));
+                let tint = if dragged.is_some() { [0.3, 1.0, 0.45, 1.0] } else if handle_hover == Some(i) { [0.35, 0.8, 1.0, 1.0] } else { [1.0, 0.8, 0.15, 1.0] };
+                let shift = dragged.unwrap_or(0.0);
+                let base = [0, 1, 2].map(|k| h.at[k] + h.dir[k] * shift.min(0.0));
+                let tip = [0, 1, 2].map(|k| h.at[k] + h.dir[k] * (shift + handle_len));
+                let head = 0.009 / unit;
+                bars.push((mul(&model, &bar(base, tip, 0.004 / unit)), tint));
+                bars.push((mul(&model, &bar([0, 1, 2].map(|k| tip[k] - h.dir[k] * head), [0, 1, 2].map(|k| tip[k] + h.dir[k] * head), 0.018 / unit)), tint));
+            }
             if section != Section::Off {
                 // A square around the model's middle, on the plane.
                 let bb = scene.bounds();
@@ -4703,7 +4972,7 @@ fn run(app: &Host) {
                     if debug_state_n % 6 == 0 {
                         let names = |v: &Vec<bool>| scene.bodies.iter().zip(v).filter(|(_, &on)| on).map(|(b, _)| b.name.as_str()).collect::<Vec<_>>().join(",");
                         log::info!(
-                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?}",
+                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={}",
                             hovered.map_or("-", |i| scene.bodies[i].name.as_str()),
                             names(&selected),
                             selected_faces.len(),
@@ -4716,11 +4985,16 @@ fn run(app: &Host) {
                             explode,
                             if edge_mode { "edges" } else if face_mode { "faces" } else { "parts" },
                             pushing,
-                            pp_drag.as_ref().map(|d| d.6)
+                            pp_drag.as_ref().map(|d| d.6),
+                            handle_list.len(),
+                            handle_hover.and_then(|i| handle_list.get(i)).map_or("-".to_string(), |h| h.label.replace(' ', "_")),
+                            handle_drag.as_ref().map_or("-".to_string(), |d| format!("{}", d.4)),
+                            moving,
+                            move_drag.as_ref().map_or("-".to_string(), |d| format!("{}:{},{},{}", scene.bodies[d.0].name, d.4[0], d.4[1], d.4[2]))
                         );
                     }
                 }
-                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, overlay, overlay_hover };
+                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, feat_page, handles: handles_on, moving, overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
                 let ni = ui.indices.len().min(UI_MAX_INDICES) / 6 * 6;

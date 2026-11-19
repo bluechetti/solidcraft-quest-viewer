@@ -31,4 +31,7 @@ or the terminal of the desktop build as `^h`), and by saying or typing one of it
 | `ai.repeat` | Repeat the last request | Ctrl+T | repeat, repeat that, again, do it again |
 | `ai.keep` | Keep the last request | Ctrl+W | keep that, save that request |
 | `ai.saved` | Saved requests | Ctrl+Q | saved requests, show saved requests |
+| `tool.move` | Move a part: drag it, let go on another part's face to set it there | Ctrl+Shift+M | move, move parts, move a part, move this |
+| `edit.handles` | Dimension handles on the model: drag one to change its size | Ctrl+Shift+H | handles, dimension handles, show the handles, hide the handles |
+| `edit.features` | Feature tree: switch a feature off or on, or edit it | Ctrl+C | features, feature tree, show the features, timeline |
 | `edit.dimensions` | Dimensions: change a size directly | Ctrl+V | dimensions, show dimensions, show the dimensions |

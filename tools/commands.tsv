@@ -23,4 +23,7 @@ ui.keyboard	On-screen keyboard	keyboard
 ai.repeat	Repeat the last request	repeat|repeat that|again|do it again
 ai.keep	Keep the last request	keep that|save that request
 ai.saved	Saved requests	saved requests|show saved requests
+tool.move	Move a part: drag it, let go on another part's face to set it there	move|move parts|move a part|move this
+edit.handles	Dimension handles on the model: drag one to change its size	handles|dimension handles|show the handles|hide the handles
+edit.features	Feature tree: switch a feature off or on, or edit it	features|feature tree|show the features|timeline
 edit.dimensions	Dimensions: change a size directly	dimensions|show dimensions|show the dimensions
