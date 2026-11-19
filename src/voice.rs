@@ -904,6 +904,12 @@ fn show_answer(json: &str) {
     if json.contains("\"changed\": true") || json.contains("\"changed\":true") {
         CHANGES.fetch_add(1, Ordering::SeqCst);
     }
+    // The request was a command's phrase ("hide these"): the render loop runs it as that button.
+    if let Some(id) = json_string(json, "command") {
+        if let Ok(mut q) = COMMANDS_IN.lock() {
+            q.push(id);
+        }
+    }
     match json_string(json, "confirm_k") {
         Some(k) => {
             CONFIRM.store(true, Ordering::SeqCst);
@@ -914,6 +920,15 @@ fn show_answer(json: &str) {
         }
         None => set_status("", Some(&heard), Some(&reply)),
     }
+}
+
+/// Commands the server recognised in a spoken or typed request, for the render loop to run, oldest first.
+static COMMANDS_IN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The next recognised command, if any.
+pub fn take_command() -> Option<String> {
+    let mut q = COMMANDS_IN.lock().ok()?;
+    if q.is_empty() { None } else { Some(q.remove(0)) }
 }
 
 /// A big request is waiting for the wearer's OK (Enter or B to go on, Esc to stop).

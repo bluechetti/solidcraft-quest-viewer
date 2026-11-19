@@ -877,6 +877,14 @@ def direct_request(text):
     return set_dimension(dim, value, " (spoken)")
 
 
+def history_text_lines():
+    """For the headset: what Undo and Redo would do next, newest first. One per line: "u" or "r", then the
+    change's words ("thickness = 12", "push/pull +5 mm", or the request as it was heard)."""
+    clean = lambda t: str(t).replace("\t", " ").replace("\n", " ")[:120]
+    return ("".join(f"u\t{clean(label)}\n" for _, label in reversed(ai_undo)) +
+            "".join(f"r\t{clean(label)}\n" for _, label in reversed(ai_redo))).encode()
+
+
 def dimensions_text():
     """For the headset, one dimension per line: id, label, value, unit, kind (user/feature/sketch), expression."""
     if session is None:
@@ -885,6 +893,26 @@ def dimensions_text():
         return "".join(f"{d['id']}\t{d['label']}\t{d['value']}\t{d['unit']}\t{d['kind']}\t{d['expression']}\n" for d in dimensions()).encode()
     except (RuntimeError, ValueError):
         return b""
+
+
+def load_commands():
+    """The viewer's own commands by phrase: {normalised phrase: (id, label)}, from commands.tsv (written from
+    the viewer's src/commands.rs). A request that is exactly one of these is the viewer's to do: the server
+    names the command in its answer and calls no AI."""
+    out = {}
+    try:
+        with open(os.path.join(HERE, "commands.tsv"), encoding="utf-8") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) == 3:
+                    for phrase in p[2].split("|"):
+                        out[phrase] = (p[0], p[1])
+    except OSError:
+        pass
+    return out
+
+
+COMMAND_PHRASES = load_commands()
 
 
 def est_tokens(obj):
@@ -1094,9 +1122,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt"):
+        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt"):
             out = {"/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
-                   "/dimensions.txt": dimensions_text}[self.path]()
+                   "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines}[self.path]()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(out)))
@@ -1365,7 +1393,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": heard, "reply": reply, "ok": ok, "changed": False, "id": note_id or ""})
             return
         t = time.time()
-        heard, reply, ok, changed = "", "", False, False
+        heard, reply, ok, changed, command = "", "", False, False, None
         # The headset sends the selected bodies' names as percent-encoded JSON.
         try:
             selected = json.loads(urllib.parse.unquote(self.headers.get("X-Selected", "") or "[]"))
@@ -1426,6 +1454,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pending["st"] = None
                 reply, ok = "Stopped: that request was not sent on.", True
                 log("spoken stop to the waiting big request")
+            elif word in COMMAND_PHRASES and not args.no_direct:
+                # One of the viewer's own commands ("hide these", "undo"): the viewer does it.
+                pending["st"] = None
+                command, reply = COMMAND_PHRASES[word]
+                ok = True
+                log(f"command by voice or text: {command}")
             elif word in UNDO_WORDS or word in REDO_WORDS:
                 pending["st"] = None
                 reply, ok = (undo_last_ai() if word in UNDO_WORDS else redo_last_ai()), True
@@ -1463,6 +1497,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         out = {"heard": heard, "reply": reply, "ok": ok, "changed": changed}
         if ok:
             out["cost"] = f"{spend.get('spent', 0.0) - spent_before:.4f}"
+        if command:
+            out["command"] = command
         if confirm_k():
             out["confirm_k"] = confirm_k()
             out["confirm_cost"] = f"{pending['st']['size'] / 1e6 * PRICE_IN:.4f}"  # about, for one more step

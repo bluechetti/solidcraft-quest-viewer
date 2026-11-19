@@ -151,44 +151,22 @@ pub fn icon_of(b: Button) -> &'static Icon {
     }
 }
 
-/// The keyboard shortcut for a button, shown with its name when it is pointed at.
-pub fn shortcut(b: Button) -> &'static str {
+/// The keyboard shortcut for a button, shown with its name when it is pointed at: the command table's
+/// (src/commands.rs), else one of the few keys that are not Ctrl with a letter.
+pub fn shortcut(b: Button) -> String {
+    let key = crate::commands::shortcut(b);
+    if !key.is_empty() {
+        return key;
+    }
     match b {
-        Button::Hide => "Ctrl+H or Del",
-        Button::Isolate => "Ctrl+I",
-        Button::ShowAll => "Ctrl+A",
-        Button::Clear => "Ctrl+D",
-        Button::Recentre => "Ctrl+R",
-        Button::Undo => "Ctrl+Z",
-        Button::Redo => "Ctrl+Y",
-        Button::Room => "Ctrl+B",
-        Button::Section => "Ctrl+S",
-        Button::Measure => "Ctrl+M",
-        Button::Edges => "Ctrl+E",
-        Button::Explode => "Ctrl+X",
-        Button::Note => "Ctrl+N",
         Button::DoNotes => "B",
-        Button::DeleteNote => "",
-        Button::Faces => "Ctrl+F",
-        Button::PushPull => "Ctrl+P",
-        Button::Place => "Ctrl+L",
-        Button::Size => "Ctrl+J",
-        Button::Models => "Ctrl+O",
         Button::Keys => "F1",
-        Button::Guides => "Ctrl+G",
-        Button::Keyboard => "Ctrl+K",
-        Button::SaveFile => "Ctrl+Shift+S",
-        Button::Snap => "Ctrl+U",
-        Button::Repeat => "Ctrl+T",
-        Button::SaveReq => "Ctrl+W",
-        Button::Saved => "Ctrl+Q",
-        Button::Dims => "Ctrl+V",
         Button::ConfirmGo => "Enter or B",
         Button::ConfirmStop => "Esc",
         Button::CancelVoice => "Esc, or say cancel",
-        Button::Reply => "",
-        Button::Tab(_) => "",
+        _ => "",
     }
+    .to_string()
 }
 
 // --- the on-screen keyboard: a floating panel of its own, with a bar to grab it by ---

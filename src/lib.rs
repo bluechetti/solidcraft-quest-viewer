@@ -23,6 +23,7 @@ use ash::{
 };
 use openxr as xr;
 
+mod commands;
 mod font;
 mod icons;
 mod panel;
@@ -3395,7 +3396,12 @@ fn run(app: &Host) {
                                 if debug_ray {
                                     debug_ray_n = debug_ray_n.wrapping_add(1);
                                     if debug_ray_n % 6 == 0 {
-                                        log::info!("PANELRAY x {x:.4} y {y:.4} t {t:.3} h {:.4} row {:?}", lay.h, overlay_row_at(overlay, y, ov_rows, lay.h));
+                                        log::info!("PANELRAY x {x:.4} y {y:.4} t {t:.3} h {:.4} row {:?} btn {:?}", lay.h, overlay_row_at(overlay, y, ov_rows, lay.h), panel::button_at(&lay, x, y));
+                                    }
+                                    // Now and then, where each button is (its middle), so a script can aim at one by name.
+                                    if debug_ray_n % 90 == 1 {
+                                        let slots: Vec<String> = lay.slots.iter().map(|s| format!("{:?}@{:.4},{:.4}", s.b, s.x + s.w / 2.0, s.top - s.h / 2.0)).collect();
+                                        log::info!("PANELSLOTS {}", slots.join(";"));
                                     }
                                 }
                                 if t > 0.0 && x.abs() <= PANEL_W / 2.0 && y.abs() <= lay.h / 2.0 {
@@ -3566,36 +3572,8 @@ fn run(app: &Host) {
                 use crate::Keycode as K;
                 let Ok(mut typed) = voice::TYPED.lock() else { continue };
                 if k.ctrl {
-                    key_btn = match k.code {
-                        K::Z if k.shift => Some(Button::Redo),
-                        K::Z => Some(Button::Undo),
-                        K::Y => Some(Button::Redo),
-                        K::H => Some(Button::Hide),
-                        K::I => Some(Button::Isolate),
-                        K::A => Some(Button::ShowAll),
-                        K::D => Some(Button::Clear),
-                        K::R => Some(Button::Recentre),
-                        K::F => Some(Button::Faces),
-                        K::P => Some(Button::PushPull),
-                        K::L => Some(Button::Place),
-                        K::J => Some(Button::Size),
-                        K::U => Some(Button::Snap),
-                        K::S if k.shift => Some(Button::SaveFile),
-                        K::S => Some(Button::Section),
-                        K::M => Some(Button::Measure),
-                        K::E => Some(Button::Edges),
-                        K::X => Some(Button::Explode),
-                        K::N => Some(Button::Note),
-                        K::B => Some(Button::Room),
-                        K::O => Some(Button::Models),
-                        K::G => Some(Button::Guides),
-                        K::K => Some(Button::Keyboard),
-                        K::T => Some(Button::Repeat),
-                        K::W => Some(Button::SaveReq),
-                        K::Q => Some(Button::Saved),
-                        K::V => Some(Button::Dims),
-                        _ => key_btn,
-                    };
+                    // Ctrl with a key: the command bound to it (src/commands.rs).
+                    key_btn = commands::by_key(k.code, k.shift).or(key_btn);
                     continue;
                 }
                 match k.code {
@@ -3650,6 +3628,13 @@ fn run(app: &Host) {
             }
             if key_btn.is_some() {
                 log::info!("key for button {key_btn:?}");
+            }
+            // A spoken or typed command the server recognised: the same button, one a frame.
+            if key_btn.is_none() {
+                if let Some(id) = voice::take_command() {
+                    key_btn = commands::by_id(&id);
+                    log::info!("command {id} for button {key_btn:?}");
+                }
             }
             let ctrl_trig = trigger.state(&session, hand_paths[1]).map(|st| st.current_state > 0.6).unwrap_or(false);
             if ctrl_trig {
