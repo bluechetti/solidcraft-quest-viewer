@@ -259,6 +259,9 @@ struct Mesh {
     indices: Vec<u32>,
     bounds: [f32; 6],
     bodies: Vec<Body>,
+    /// An edit of the model already on show (the server's beacon said so): the view keeps its size and
+    /// place, so what changed is seen to change. False for another model, which is fitted afresh.
+    same_model: bool,
 }
 
 /// One body (an OBJ object from SolidCraft): a contiguous range of the index buffer.
@@ -1869,7 +1872,7 @@ fn parse_scm(b: &[u8]) -> Result<Mesh, String> {
     if bodies.is_empty() {
         bodies.push(Body { name: "model".into(), first: 0, count: ni as u32, aabb: [0.0; 6] });
     }
-    Ok(Mesh { verts: b[vstart..istart].to_vec(), indices, bounds, bodies })
+    Ok(Mesh { verts: b[vstart..istart].to_vec(), indices, bounds, bodies, same_model: false })
 }
 
 /// Reads `sea.scm` from the app's files folder (pushed by adb, or saved from the last Wi-Fi download).
@@ -1890,9 +1893,14 @@ fn load_scm(app: &Host) -> Option<Mesh> {
 
 /// Model scale and centring: Z-up model units to Y-up metres, longest side 1.6 m, centred on the origin.
 fn model_inner(bounds: &[f32; 6]) -> M4 {
-    let size = (0..3).map(|k| bounds[k + 3] - bounds[k]).fold(1e-6f32, f32::max);
+    let size = longest_side(bounds);
     let c = |k: usize| (bounds[k] + bounds[k + 3]) * 0.5;
     mul(&mul(&scale(1.6 / size), &z_up_to_y_up()), &translate(-c(0), -c(1), -c(2)))
+}
+
+/// The longest side of a box of bounds, in model units (never zero).
+fn longest_side(bounds: &[f32; 6]) -> f32 {
+    (0..3).map(|k| bounds[k + 3] - bounds[k]).fold(1e-6f32, f32::max)
 }
 
 const BEACON_PORT: u16 = 47800;
@@ -1952,6 +1960,7 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
     };
     log::info!("listening for the Mac on UDP {BEACON_PORT}");
     let mut loaded: Option<(std::net::IpAddr, String)> = None;
+    let mut shown_model: Option<(std::net::IpAddr, String)> = None;
     // The notes version (the beacon's 4th field) last fetched.
     let mut notes_loaded: Option<(std::net::IpAddr, String)> = None;
     let mut buf = [0u8; 256];
@@ -1993,6 +2002,8 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
         if let Some(p) = parts.next() {
             voice::set_preview(p == "p1");
         }
+        // The 7th field: m and a name for the model, the same through all its edits ("-" or absent: not said).
+        let model_id = parts.next().and_then(|m| m.strip_prefix('m')).filter(|m| *m != "-").map(|m| (from.ip(), m.to_string()));
         let key = (from.ip(), version.to_string());
         if loaded.as_ref() == Some(&key) {
             continue;
@@ -2001,7 +2012,8 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
         let t = Instant::now();
         let body = http_get(std::net::SocketAddr::new(from.ip(), port), "/model.scm", 30);
         match body.map_err(|e| e.to_string()).and_then(|b| parse_scm(&b).map(|m| (m, b))) {
-            Ok((mesh, bytes)) => {
+            Ok((mut mesh, bytes)) => {
+                mesh.same_model = model_id.is_some() && model_id == shown_model;
                 log::info!("downloaded {} triangles ({} MB) in {} ms", mesh.indices.len() / 3, bytes.len() / 1_000_000, t.elapsed().as_millis());
                 if let Some(d) = &save_dir {
                     let tmp = d.join("sea.scm.part");
@@ -2012,6 +2024,7 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
                 // Only count it as loaded when a render loop took it (none while the app is reopening).
                 let sent = NET_TX.lock().ok().and_then(|t| t.as_ref().map(|tx| tx.send(mesh).is_ok())).unwrap_or(false);
                 if sent {
+                    shown_model = model_id;
                     loaded = Some(key);
                 } else {
                     log::info!("no render loop to take the model yet; will fetch it again");
@@ -2045,7 +2058,7 @@ fn stl_mesh(stl: &[u8], tris: usize) -> Mesh {
         }
     }
     let bodies = vec![Body { name: "model".into(), first: 0, count: (tris * 3) as u32, aabb: [0.0; 6] }];
-    Mesh { verts, indices: (0..(tris * 3) as u32).collect(), bounds, bodies }
+    Mesh { verts, indices: (0..(tris * 3) as u32).collect(), bounds, bodies, same_model: false }
 }
 
 /// Reads a binary STL: returns the file bytes (80-byte header, u32 count, 50-byte records) and the triangle count.
@@ -2656,6 +2669,9 @@ fn run(app: &Host) {
         let (mut vbuf, mut vmem, mut ibuf, mut imem, mut index_count) = upload_mesh(&mesh);
         log::info!("uploaded {} triangles in {} ms", tris, t.elapsed().as_millis());
         let mut model_inner = model_inner(&mesh.bounds);
+        // Metres per model unit in model_inner. It is kept through the edits of one model, so after an
+        // edit the longest side may no longer be 1.6 m.
+        let mut inner_scale = 1.6 / longest_side(&mesh.bounds);
         let mut scene = Scene::new(mesh);
         log::info!("{} bodies", scene.bodies.len());
         // Edge lines index the model's vertex buffer (never empty: Vulkan buffers need a size).
@@ -2901,11 +2917,15 @@ fn run(app: &Host) {
         // towards a choice marks it; letting the stick go (or the trigger) runs it as that button. The
         // menu: the hand's pose when it opened, its choices, the one marked, whether the stick opened it,
         // and what it is a menu for.
-        let mut radial: Option<(M4, Vec<Button>, Option<usize>, bool, &'static str)> = None;
+        let mut radial: Option<(M4, Vec<Button>, Option<usize>, bool, &'static str, [f32; 3])> = None;
         let mut radial_ran = 0u32;
         let mut handles_on = false;
         let mut handle_hover: Option<usize>;
         let mut handle_drag: Option<(usize, svr::precise::Drag, [f32; 3], [f32; 3], f32)> = None;
+        // The id of the handle being dragged. The list is fetched again whenever the model changes (someone
+        // else's edit, an AI change): if the handle at that place in the list is then another one, the drag
+        // is dropped rather than its value sent to the wrong dimension.
+        let mut handle_drag_id = String::new();
         // The dragged value is at its limit (the hand buzzes once when it gets there).
         let mut handle_at_limit = false;
         let mut buzzes = 0u32;
@@ -3330,6 +3350,9 @@ fn run(app: &Host) {
             }
             let pressed = hand_paths.iter().any(|&h| recentre.state(&session, h).map(|st| st.current_state).unwrap_or(false));
             if pressed && !recentre_was {
+                // Fitted afresh to the model as it is now (edits kept the view's size and place).
+                model_inner = crate::model_inner(&scene.bounds());
+                inner_scale = 1.6 / longest_side(&scene.bounds());
                 world = None;
                 grab.release();
                 need_anchor = true;
@@ -3368,7 +3391,12 @@ fn run(app: &Host) {
                 vk_device.destroy_buffer(ibuf, None);
                 vk_device.free_memory(imem, None);
                 (vbuf, vmem, ibuf, imem, index_count) = upload_mesh(&m);
-                model_inner = crate::model_inner(&m.bounds);
+                // An edit keeps the view's size and place: a plate made twice as long is seen to grow, where
+                // fitting it afresh would show it half as thick. Another model is fitted afresh.
+                if !m.same_model {
+                    model_inner = crate::model_inner(&m.bounds);
+                    inner_scale = 1.6 / longest_side(&m.bounds);
+                }
                 tris = m.indices.len() / 3;
                 // Keep what was hidden and selected, by body name (an AI change rebuilds the mesh).
                 let (was_hidden, was_selected) = (names_where(&scene, &hidden), names_where(&scene, &selected));
@@ -3378,6 +3406,12 @@ fn run(app: &Host) {
                 (ebuf, emem) = upload_edges(&scene);
                 hidden = flags_for(&scene, &was_hidden);
                 selected = flags_for(&scene, &was_selected);
+                // A part or face held by its number in the old mesh may be another one in the new: a move or a
+                // push/pull in progress is dropped, not sent for the wrong part.
+                if move_drag.take().is_some() | pp_drag.take().is_some() {
+                    log::info!("drag dropped: the model changed under it");
+                    voice::say("The model changed, so that drag was dropped.");
+                }
                 // Face numbers change with the mesh: the face selection does not carry over.
                 selected_faces.clear();
                 selected_edges.clear();
@@ -3640,6 +3674,9 @@ fn run(app: &Host) {
                             };
                             let hit = scene.pick(o_m, d_m, pickable, cut, &offsets);
                             pick_ms_sum += t0.elapsed().as_secs_f64() * 1000.0;
+                            // While a dimension handle is held the ray is the handle's: the parts it passes over
+                            // are not lit up and the panel's title does not change.
+                            let hit = if handle_drag.is_some() { None } else { hit };
                             hovered = hit.map(|(b, _, _)| b);
                             if let Some((_, _, tri)) = hit {
                                 hovered_face = Some(scene.tri_patch[tri]);
@@ -3903,7 +3940,20 @@ fn run(app: &Host) {
                     log::info!("radial: open for {what}: {}", line.join(" | "));
                     let names: Vec<&str> = items.iter().map(|b| radial_label(*b)).collect();
                     voice::say(&format!("Menu, from up, clockwise: {}", names.join(", ")));
-                    radial = Some((pm, items, None, by_stick, what));
+                    // The ring stands a forearm's length along the ray, upright and facing the head, so it is
+                    // seen as a ring from wherever the hand is, and "up" on it is up in the room. (Square to the
+                    // ray, a hand held low and to the side showed it nearly edge on.)
+                    let hand0 = [pm[12], pm[13], pm[14]];
+                    let o = [0, 1, 2].map(|k| pm[12 + k] - pm[8 + k] * 0.3);
+                    let to_head = head_now.map_or([pm[8], pm[9], pm[10]], |h| sub(h, o));
+                    let flat = [to_head[0], 0.0, to_head[2]];
+                    let n = if dot(flat, flat) > 1e-6 { normalize(flat) } else { [0.0, 0.0, 1.0] };
+                    let (up, right) = ([0.0, 1.0, 0.0], normalize(cross([0.0, 1.0, 0.0], n)));
+                    let mut frame = pm;
+                    for k in 0..3 {
+                        (frame[k], frame[4 + k], frame[8 + k], frame[12 + k]) = (right[k], up[k], n[k], o[k]);
+                    }
+                    radial = Some((frame, items, None, by_stick, what, hand0));
                 }
                 key_btn = None;
             } else if key_btn == Some(Button::Radial) {
@@ -3911,13 +3961,13 @@ fn run(app: &Host) {
                 voice::say("");
                 radial = None;
                 key_btn = None;
-            } else if let Some((pm0, items, pick, by_stick, _)) = radial.as_mut() {
+            } else if let Some((pm0, items, pick, by_stick, _, hand0)) = radial.as_mut() {
                 // The choice: the way the stick is pushed, else the way the hand has moved since it opened.
                 let pushed = stick.state(&session, hand_paths[1]).ok().map(|st| st.current_state).filter(|v| v.x.abs() > 0.3 || v.y.abs() > 0.3);
                 let now = match (pushed, ray) {
                     (Some(v), _) => svr::radial::sector(v.x, v.y, items.len(), 0.5),
                     (None, Some((pm, _))) => {
-                        let d = sub([pm[12], pm[13], pm[14]], [pm0[12], pm0[13], pm0[14]]);
+                        let d = sub([pm[12], pm[13], pm[14]], *hand0);
                         svr::radial::sector(dot(d, [pm0[0], pm0[1], pm0[2]]), dot(d, [pm0[4], pm0[5], pm0[6]]), items.len(), 0.04)
                     }
                     _ => *pick,
@@ -3974,7 +4024,12 @@ fn run(app: &Host) {
                 }
             }
             if let Some((i, ref mut drag, hand0, dir_w, ref mut value)) = handle_drag {
-                match (handle_list.get(i), ray) {
+                match (handle_list.get(i).filter(|h| h.id == handle_drag_id), ray) {
+                    (None, _) => {
+                        log::info!("handle drag dropped: the model changed under it");
+                        voice::say("The model changed, so that drag was dropped.");
+                        handle_drag = None;
+                    }
                     (Some(h), Some((pm, _))) => {
                         let along = (dot(sub([pm[12], pm[13], pm[14]], hand0), dir_w) / unit) as f64;
                         let fine = held[1];
@@ -4061,6 +4116,7 @@ fn run(app: &Host) {
                     let dir_w = normalize(transform(&model, h.dir, 0.0));
                     handle_drag = Some((i, svr::precise::Drag::start(0.0, 0.0), [pm[12], pm[13], pm[14]], dir_w, h.value));
                     handle_at_limit = false;
+                    handle_drag_id = h.id.clone();
                     log::info!("handle {}: taken hold of at {}", h.label, h.value);
                 }
             }
@@ -4326,6 +4382,8 @@ fn run(app: &Host) {
                                 }
                             }
                             Button::Recentre => {
+                                model_inner = crate::model_inner(&scene.bounds());
+                                inner_scale = 1.6 / longest_side(&scene.bounds());
                                 world = None;
                                 grab.release();
                                 need_anchor = true;
@@ -4340,8 +4398,7 @@ fn run(app: &Host) {
                                 let w0 = world.unwrap_or(cur);
                                 let sc0 = (w0[0] * w0[0] + w0[1] * w0[1] + w0[2] * w0[2]).sqrt().max(1e-6);
                                 let bb = scene.bounds();
-                                let longest_m = (0..3).map(|k| bb[k + 3] - bb[k]).fold(0.0f32, f32::max).max(1e-3) / 1000.0;
-                                let now = 1.6 * sc0 / longest_m;
+                                let now = inner_scale * 1000.0 * sc0;
                                 let next = SIZE_STEPS.iter().copied().find(|&x| x > now * 1.05).unwrap_or(SIZE_STEPS[1]);
                                 let k = next / now;
                                 let m0 = mul(&w0, &model_inner);
@@ -4349,7 +4406,7 @@ fn run(app: &Host) {
                                 let low = corners.iter().map(|c| c[1]).fold(f32::MAX, f32::min);
                                 let p = [corners.iter().map(|c| c[0]).sum::<f32>() / 8.0, low, corners.iter().map(|c| c[2]).sum::<f32>() / 8.0];
                                 world = Some(mul(&translate(p[0], p[1], p[2]), &mul(&scale(k), &mul(&translate(-p[0], -p[1], -p[2]), &w0))));
-                                voice::say(&format!("Size x{next} of the file's: {:.0} cm long.", next * longest_m * 100.0));
+                                voice::say(&format!("Size x{next} of the file's: {:.0} cm long.", next * longest_side(&bb) / 10.0));
                             }
                             Button::Place => {
                                 placing = !placing;
@@ -4548,7 +4605,7 @@ fn run(app: &Host) {
                         let longest_mm = (0..3).map(|k| bb0[k + 3] - bb0[k]).fold(0.0f32, f32::max).max(1e-3);
                         let real_m = longest_mm / 1000.0;
                         let (target_m, one_to_one) = if real_m <= 0.45 { (real_m, true) } else { (0.3, false) };
-                        let (sc, yaw) = (target_m / 1.6, (-cur[2]).atan2(cur[0]));
+                        let (sc, yaw) = (target_m / (inner_scale * longest_mm), (-cur[2]).atan2(cur[0]));
                         let level = mul(&translate(cur[12], cur[13], cur[14]), &mul(&rot_y(yaw), &scale(sc)));
                         let model_l = mul(&level, &model_inner);
                         let bb = scene.bounds();
@@ -4761,10 +4818,10 @@ fn run(app: &Host) {
             let mut bars: Vec<(M4, [f32; 4])> = Vec::new();
             // The radial menu: a ring of blocks where the hand was when it opened, the marked one bigger and
             // light blue, and a line from the middle to the hand.
-            if let Some((pm0, items, pick, _, _)) = &radial {
-                // A forearm's length along the ray from where the hand was, so it is in view and not behind the controller.
+            if let Some((pm0, items, pick, _, _, hand0)) = &radial {
+                // Its frame was set when it opened: upright, facing the head, a forearm's length along the ray.
                 let (right, up) = ([pm0[0], pm0[1], pm0[2]], [pm0[4], pm0[5], pm0[6]]);
-                let o = [0, 1, 2].map(|k| pm0[12 + k] - pm0[8 + k] * 0.3);
+                let o = [pm0[12], pm0[13], pm0[14]];
                 let at = |x: f32, y: f32| [0, 1, 2].map(|k| o[k] + right[k] * x + up[k] * y);
                 for i in 0..items.len() {
                     let (x, y) = svr::radial::centre(i, items.len(), 0.08);
@@ -4774,7 +4831,7 @@ fn run(app: &Host) {
                 bars.push((bar(at(0.0, -0.003), at(0.0, 0.003), 0.006), [1.0, 0.8, 0.15, 1.0]));
                 // The hand's move since it opened, as a line from the middle (the ring is 8 cm out; 4 cm picks).
                 if let Some((pm, _)) = ray {
-                    let d = sub([pm[12], pm[13], pm[14]], [pm0[12], pm0[13], pm0[14]]);
+                    let d = sub([pm[12], pm[13], pm[14]], *hand0);
                     let (x, y) = (dot(d, right).clamp(-0.08, 0.08), dot(d, up).clamp(-0.08, 0.08));
                     if x.abs() > 0.002 || y.abs() > 0.002 {
                         bars.push((bar(o, at(x, y), 0.003), [1.0, 0.8, 0.15, 1.0]));
@@ -4993,6 +5050,11 @@ fn run(app: &Host) {
                     continue;
                 }
                 let (range, tint) = if overlaps_shown && clash_names.iter().any(|n| *n == scene.bodies[i].name) {
+                    // A round part has no edges along its sides (a pin is two rings, seen from the side two
+                    // dashes): its triangle edges go under the outline, dimmer, so its shape is still there.
+                    if scene.feat[i].1 * 2 < scene.all[i].1 {
+                        draws.push((scene.all[i].0, scene.all[i].1, [0.5, 0.1, 0.08, 1.0], off_draw(i)));
+                    }
                     (scene.feat[i], [1.0, 0.15, 0.1, 1.0])
                 } else if selected[i] {
                     (scene.feat[i], SELECT_EDGE_TINT)
@@ -5167,9 +5229,7 @@ fn run(app: &Host) {
                 let size_idx = {
                     let w = world.unwrap_or(cur);
                     let sc = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-                    let bb = scene.bounds();
-                    let longest_m = (0..3).map(|k| bb[k + 3] - bb[k]).fold(0.0f32, f32::max).max(1e-3) / 1000.0;
-                    let now = 1.6 * sc / longest_m;
+                    let now = inner_scale * 1000.0 * sc;
                     SIZE_STEPS.iter().position(|&x| (now / x - 1.0).abs() < 0.05)
                 };
                 // For tests without a headset (SCVIEW_DEBUG_RAY=1): what the viewer holds, ten times a second.

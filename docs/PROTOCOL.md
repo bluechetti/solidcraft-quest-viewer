@@ -147,6 +147,11 @@ Not in David's published server; described here so another client can use them. 
 | `GET /clashes.txt` | `body a \t body b \t volume mm3 \t x \t y \t z \t part a \t part b` | The last check's pairs, with the middle of each overlap. |
 | `POST /preview/apply`, `/preview/cancel` | | With `--preview ai` (the default) an AI change is shown first; these keep it or drop it. The beacon's `p1` field says a preview is on show. |
 
+The beacon has a seventh field, `m<id>`: a name for the model on show that stays the same through all its
+edits and changes when another model is opened (`m-` while there is none). A viewer that fits its view to a
+model's size should do so when this changes, and keep its scale and place otherwise: fitted afresh after
+every edit, a plate made twice as long looks half as thick instead.
+
 A reply to `/ask` may also carry `"command": "<id>"` (a viewer command from `tools/commands.tsv` that the
 words named, done by the viewer itself) or `"select"` (body names joined by `\x1f`, to select).
 

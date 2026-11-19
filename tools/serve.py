@@ -60,6 +60,7 @@ CLAUDE_MODEL = "claude-haiku-5-5"
 # LM Studio, vLLM) on this computer or the local network: no key, no cost, nothing leaves the network.
 AI = {"backend": "anthropic", "url": "http://localhost:11434/v1", "model": "qwen3.8:27b", "think": "none", "ctx": 0}
 
+STARTED = int(time.time())
 state = {"data": None, "version": None, "name": None, "counter": 0, "source": None, "notes": [], "notes_version": 0}
 lock = threading.Lock()
 args = None
@@ -2337,7 +2338,7 @@ def beacon(port, quest):
         with lock:
             version, nv = state["version"], state["notes_version"]
         if version:
-            msg = f"SCVIEW1 {port} {version} n{nv} b{balance_text()} p{1 if state.get('preview') else 0}".encode()
+            msg = f"SCVIEW1 {port} {version} n{nv} b{balance_text()} p{1 if state.get('preview') else 0} m{state.get('model', '-')}".encode()
             for addr in ["255.255.255.255"] + ([quest] if quest else []):
                 try:
                     s.sendto(msg, (addr, BEACON_PORT))
@@ -2433,6 +2434,11 @@ def load(src):
     """Open or convert the source and publish it."""
     explode["view"] = None  # a newly opened design is assembled
     global session
+    # A name for this model that stays through its edits: the headset fits its view afresh only when it
+    # changes (the mesh published next carries it in the beacon).
+    with lock:
+        state["opened"] = state.get("opened", 0) + 1
+        state["model"] = f"{STARTED:x}.{state['opened']}"
     ext = os.path.splitext(src)[1].lower()
     # A different model: the AI's undo and redo steps belonged to the last one.
     if state["source"] != os.path.abspath(src):
