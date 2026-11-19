@@ -2919,6 +2919,9 @@ fn run(app: &Host) {
         // and what it is a menu for.
         let mut radial: Option<(M4, Vec<Button>, Option<usize>, bool, &'static str, [f32; 3])> = None;
         let mut radial_ran = 0u32;
+        // After the menu closes the stick is still pushed for a moment (it was let go of by its click): it
+        // does not turn or size the model until it has been back in the middle.
+        let mut stick_rest = false;
         let mut handles_on = false;
         let mut handle_hover: Option<usize>;
         let mut handle_drag: Option<(usize, svr::precise::Drag, [f32; 3], [f32; 3], f32)> = None;
@@ -3297,7 +3300,11 @@ fn run(app: &Host) {
                 log::info!("grab {mode}; held L {} R {}, tracked L {} R {}", held[0], held[1], hand[0].is_some(), hand[1].is_some());
                 grab_mode = mode;
             }
-            if !grab.holding() && radial.is_none() {
+            if stick_rest {
+                let v = stick.state(&session, hand_paths[1]).map(|st| st.current_state).unwrap_or(xr::Vector2f { x: 0.0, y: 0.0 });
+                stick_rest = v.x.abs() > 0.2 || v.y.abs() > 0.2;
+            }
+            if !grab.holding() && radial.is_none() && !stick_rest {
                 if let Ok(st) = stick.state(&session, hand_paths[1]) {
                     let v = st.current_state;
                     if st.is_active && (v.x.abs() > 0.2 || v.y.abs() > 0.2) {
@@ -3919,6 +3926,7 @@ fn run(app: &Host) {
                 reply_page = if pages == 0 { 0 } else { (reply_page + 1) % pages };
             }
             // The radial menu.
+            let radial_was_open = radial.is_some();
             let stick_down = stick_click.state(&session, hand_paths[1]).map(|st| st.current_state).unwrap_or(false);
             let mut radial_took_trigger = false;
             if radial.is_none() && (key_btn == Some(Button::Radial) || (stick_down && !click_was[1])) {
@@ -3991,6 +3999,9 @@ fn run(app: &Host) {
                     }
                     radial = None;
                 }
+            }
+            if radial_was_open && radial.is_none() {
+                stick_rest = true;
             }
             // Dimension handles: which one the pointer is on, the drag of one, and the press that starts it.
             let handle_list = if handles_on { voice::HANDLES.lock().map(|h| h.clone()).unwrap_or_default() } else { Vec::new() };
