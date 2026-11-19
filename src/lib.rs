@@ -5292,6 +5292,34 @@ fn run(app: &Host) {
                 vk_device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
                 vk_device.cmd_draw_indexed(cmd, ni as u32, 1, 0, 0, 0);
             }
+            // The radial menu's names, each beside its block, on the ring's own upright plane. They use the
+            // keyboard's buffers, so they are left out while the keyboard is open (the panel still lists them).
+            if let (None, Some((pm0, items, pick, _, _, _))) = (&kb_m, &radial) {
+                let mut rui = Ui { verts: Vec::new(), indices: Vec::new() };
+                let fp = FONT_PX * 1.7;
+                let h = font::FONT_H as f32 * fp;
+                for (i, b) in items.iter().enumerate() {
+                    let (x, y) = svr::radial::centre(i, items.len(), 0.108);
+                    let name = radial_label(*b);
+                    let w = Ui::text_width_px(name, fp);
+                    // Outward of the block: to its right on the right half, to its left on the left, centred above and below.
+                    let x0 = if x > 0.02 { x } else if x < -0.02 { x - w } else { x - w / 2.0 };
+                    let top = if y > 0.02 { y + h } else if y < -0.02 { y } else { y + h / 2.0 };
+                    let picked = *pick == Some(i);
+                    rui.quad(x0 - 0.004, top - h - 0.003, x0 + w + 0.004, top + 0.003, 0.0, if picked { [30, 110, 180] } else { [18, 24, 34] });
+                    rui.text_px(name, x0, top, 0.001, if picked { [255, 255, 255] } else { [215, 225, 240] }, fp);
+                }
+                let nv = (rui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
+                let ni = rui.indices.len().min(UI_MAX_INDICES) / 6 * 6;
+                let ni = rui.indices[..ni].iter().take_while(|&&i| (i as usize) < nv).count() / 6 * 6;
+                let (vb, _, vp, ib, _, ip) = ui_bufs[PIPELINE_DEPTH as usize + frame];
+                std::ptr::copy_nonoverlapping(rui.verts.as_ptr(), vp, nv * VERTEX_SIZE);
+                std::ptr::copy_nonoverlapping(rui.indices.as_ptr() as *const u8, ip, ni * 4);
+                push(cmd, &push_for(pm0, [0.0; 4]));
+                vk_device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+                vk_device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
+                vk_device.cmd_draw_indexed(cmd, ni as u32, 1, 0, 0, 0);
+            }
             if let (Some((pm, len)), false) = (ray, use_mouse) {
                 let mut s = identity();
                 s[0] = 0.004;
