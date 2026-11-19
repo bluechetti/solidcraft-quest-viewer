@@ -49,6 +49,8 @@ const MEASURE_TINT: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
 const HOVER_TINT: [f32; 4] = [0.35, 0.8, 1.0, 0.3];
 const SELECT_TINT: [f32; 4] = [1.0, 0.55, 0.1, 0.25];
 const SELECT_EDGE_TINT: [f32; 4] = [1.0, 0.5, 0.05, 1.0];
+/// The whole model while it is a preview of a change not made yet: clearly green.
+const PREVIEW_TINT: [f32; 4] = [0.2, 0.95, 0.4, 0.55];
 
 type M4 = [f32; 16];
 
@@ -938,13 +940,12 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
     let sel = st.notes_selected > 0;
     match b {
         Button::Tab(t) => t.label(),
-        Button::ConfirmGo => {
-            if short {
-                "Go on"
-            } else {
-                "Go on with the big request"
-            }
-        }
+        Button::ConfirmGo => match (voice::preview(), short) {
+            (true, true) => "Apply",
+            (true, false) => "Apply the change on show",
+            (false, true) => "Go on",
+            (false, false) => "Go on with the big request",
+        },
         Button::Reply => "Read the full reply (click: next page)",
         Button::CancelVoice => {
             if short {
@@ -953,13 +954,12 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Cancel the recording: nothing is sent"
             }
         }
-        Button::ConfirmStop => {
-            if short {
-                "Stop"
-            } else {
-                "Stop: do not send the big request"
-            }
-        }
+        Button::ConfirmStop => match (voice::preview(), short) {
+            (true, true) => "Drop",
+            (true, false) => "Drop it: change nothing",
+            (false, true) => "Stop",
+            (false, false) => "Stop: do not send the big request",
+        },
         Button::Repeat => {
             if short {
                 "Repeat"
@@ -1871,6 +1871,10 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
         }
         if let Some(b) = parts.next() {
             voice::set_spend(b.strip_prefix('b').unwrap_or(""));
+        }
+        // The 6th field: p1 while the model on show is a preview of a change not made yet.
+        if let Some(p) = parts.next() {
+            voice::set_preview(p == "p1");
         }
         let key = (from.ip(), version.to_string());
         if loaded.as_ref() == Some(&key) {
@@ -4406,6 +4410,7 @@ fn run(app: &Host) {
             }
             // Draw runs: consecutive bodies with the same state (and, when exploded, the same move) share
             // one draw call; hidden ones are skipped.
+            let previewing = voice::preview();
             let mut runs: Vec<(u32, u32, Option<[f32; 4]>, [f32; 3])> = Vec::new();
             for (i, b) in scene.bodies.iter().enumerate() {
                 let tint = if hidden[i] {
@@ -4414,6 +4419,8 @@ fn run(app: &Host) {
                     Some(SELECT_TINT)
                 } else if Some(i) == hovered && !edge_mode && !face_mode && !pushing {
                     Some(HOVER_TINT)
+                } else if previewing {
+                    Some(PREVIEW_TINT)
                 } else {
                     Some([0.0; 4])
                 };

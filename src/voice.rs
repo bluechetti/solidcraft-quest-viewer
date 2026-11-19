@@ -944,6 +944,11 @@ fn show_answer(json: &str) {
             let cost = if cents < 0.1 { "<0.1c".to_string() } else if cents < 10.0 { format!("~{cents:.1}c") } else { format!("~{:.0}c", cents) };
             set_status(&format!("Big: ~{k}k tokens, {cost}. Go on?"), Some(&heard), None);
         }
+        None if json.contains("\"preview\": true") => {
+            // Shown, not made: the panel offers Apply and Drop.
+            PREVIEW.store(true, Ordering::SeqCst);
+            set_status("Preview. Apply it?", Some(&heard), Some(&reply));
+        }
         None => set_status("", Some(&heard), Some(&reply)),
     }
 }
@@ -961,18 +966,57 @@ pub fn take_command() -> Option<String> {
 static CONFIRM: AtomicBool = AtomicBool::new(false);
 
 pub fn confirm_pending() -> bool {
-    CONFIRM.load(Ordering::SeqCst)
+    CONFIRM.load(Ordering::SeqCst) || PREVIEW.load(Ordering::SeqCst)
 }
 
-/// Esc: drop the waiting request.
+/// The model on show is a preview: what the last request would give. The design itself is unchanged until
+/// the wearer applies it. The Mac's beacon says so every second, and its answer to the request does at once.
+static PREVIEW: AtomicBool = AtomicBool::new(false);
+
+pub fn preview() -> bool {
+    PREVIEW.load(Ordering::SeqCst)
+}
+
+pub fn set_preview(on: bool) {
+    PREVIEW.store(on, Ordering::SeqCst);
+}
+
+/// Applies (`true`) or drops the change on show.
+fn settle_preview(apply: bool) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    PREVIEW.store(false, Ordering::SeqCst);
+    set_status(if apply { "Applying..." } else { "Dropping..." }, None, None);
+    std::thread::spawn(move || {
+        match post_typed(if apply { "/preview/apply" } else { "/preview/cancel" }, b"", "text/plain", 120, "") {
+            Ok(json) => {
+                if json.contains("\"changed\": true") {
+                    CHANGES.fetch_add(1, Ordering::SeqCst);
+                }
+                set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+            }
+            Err(e) => set_status("", None, Some(&e)),
+        }
+        BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Esc: drop the waiting request, or the change on show.
 pub fn cancel_confirm() {
-    if CONFIRM.swap(false, Ordering::SeqCst) {
+    if PREVIEW.load(Ordering::SeqCst) {
+        settle_preview(false);
+    } else if CONFIRM.swap(false, Ordering::SeqCst) {
         set_status("", None, Some("Stopped: that request was not sent on."));
     }
 }
 
 /// The wearer said OK: the Mac carries on with the request that was waiting.
 pub fn confirm_ai() {
+    if PREVIEW.load(Ordering::SeqCst) {
+        settle_preview(true);
+        return;
+    }
     if !CONFIRM.load(Ordering::SeqCst) || BUSY.swap(true, Ordering::SeqCst) {
         return;
     }

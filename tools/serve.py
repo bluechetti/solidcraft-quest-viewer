@@ -114,8 +114,8 @@ class Mcp:
         return text, bool(r.get("isError"))
 
 
-def export_scm():
-    """Export the session's design to OBJ, convert it, and publish it as a new version."""
+def export_bytes():
+    """The session's design as the headset's mesh (OBJ export, converted)."""
     obj = os.path.join(work, "model.obj")
     out = os.path.join(work, "model.scm")
     text, err = session.call("export", {"path": obj, "format": "obj"})
@@ -124,12 +124,89 @@ def export_scm():
     subprocess.run([sys.executable, "-I", os.path.join(HERE, "obj_to_scm.py"), obj, out], check=True,
                    stdout=subprocess.DEVNULL)
     with open(out, "rb") as f:
-        data = f.read()
+        return f.read()
+
+
+def publish(data, is_preview=False):
+    """Make `data` the mesh the headset shows. A preview is what a change would give: the design itself
+    is as it was, and the beacon says so, so the headset can show it differently."""
     with lock:
         state["counter"] += 1
         state["data"] = data
+        state["preview"] = is_preview
         state["version"] = f"{int(time.time()):x}-{state['counter']}"
     return data
+
+
+def export_scm():
+    """Export the session's design, and publish it as a new version."""
+    return publish(export_bytes())
+
+
+# --- preview: show what a change would give, and make it only when the wearer says so ---
+
+waiting = {"p": None}  # the change on show: {"label", "reply", "steps", "selected"}
+
+
+def apply_steps(steps):
+    """Run tool calls the AI made before (as recorded in a run's "steps"); True when the design changed."""
+    changed = False
+    for stp in steps:
+        name, inp = stp["name"], json.loads(json.dumps(stp["input"]))
+        if name == "colour_each":
+            text, err = colour_each(inp)
+        else:
+            text, err = session.call(name, expand_all_bodies(name, inp))
+        log(f"  apply {name} {json.dumps(inp)[:120]} -> {'ERROR ' if err else ''}{text[:100]}")
+        changed |= not err
+    return changed
+
+
+def preview_of(label, run):
+    """Run a change inside a checkpoint, keep the mesh it gives, and put the design back.
+    `run()` makes the change and returns (reply, changed, steps to make it again). Returns (reply, shown):
+    shown is False when nothing changed, and then nothing waits."""
+    text, err = session.call("execute", {"command": "edit.checkpoint", "params": {}})
+    if err:
+        raise RuntimeError(f"no checkpoint: {text[:160]}")
+    cp = json.loads(text)["checkpoint"]
+    data = None
+    try:
+        reply, changed, steps = run()
+        if changed:
+            data = export_bytes()
+    finally:
+        text, err = session.call("execute", {"command": "edit.restore_checkpoint", "params": {"checkpoint": cp}})
+        if err:
+            log(f"preview: the design could not be put back: {text[:200]}")
+    if not changed or data is None:
+        return reply, False
+    waiting["p"] = {"label": label, "reply": reply, "steps": steps}
+    publish(data, is_preview=True)
+    log(f"preview on show for: {label!r} ({len(steps)} step(s) to apply)")
+    return reply, True
+
+
+def preview_apply():
+    """Make the change on show: (reply, changed)."""
+    p, waiting["p"] = waiting["p"], None
+    if p is None:
+        return "Nothing is waiting to be applied.", False
+    before = undo_depth()
+    changed = apply_steps(p["steps"])
+    finish_ai(p["label"], before, changed)
+    if not changed:
+        export_scm()
+    return (f"Applied: {p['reply']}" if changed else "That could not be applied; nothing was changed."), changed
+
+
+def preview_cancel():
+    """Drop the change on show and show the design as it is."""
+    p, waiting["p"] = waiting["p"], None
+    if p is None:
+        return "Nothing is waiting."
+    export_scm()
+    return "Dropped: nothing was changed."
 
 
 # --- Claude ---
@@ -999,6 +1076,7 @@ UNDO_WORDS = {"undo", "undo that", "undo it", "undo this", "undo the last", "und
 REDO_WORDS = {"redo", "redo that", "redo it", "redo this", "redo the last", "redo last", "redo the last change",
               "redo the last request", "redo the last one", "redo last change", "redo last request", "redo the change"}
 STOP_WORDS = {"stop", "cancel", "no", "no thanks", "never mind", "nevermind", "forget it", "abort"}
+APPLY_WORDS = {"apply", "apply it", "apply that", "yes apply", "keep it", "keep that", "confirm"}
 
 
 def resume_pending():
@@ -1155,7 +1233,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authorised():
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
-                             "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension"):
+                             "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
+                             "/preview/apply", "/preview/cancel"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1290,6 +1369,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        if self.path in ("/preview/apply", "/preview/cancel"):
+            # The change on show: make it, or drop it.
+            reply, changed = "", False
+            try:
+                if self.path.endswith("apply"):
+                    reply, changed = preview_apply()
+                else:
+                    reply = preview_cancel()
+            except Exception as e:
+                reply = str(e)
+            log(f"{self.path}: {reply}")
+            self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": changed})
+            return
         if self.path == "/ask/confirm":
             # The wearer said OK to a big request that was waiting: carry on from where it stopped.
             reply, changed, ok = "", False, False
@@ -1393,7 +1485,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": heard, "reply": reply, "ok": ok, "changed": False, "id": note_id or ""})
             return
         t = time.time()
-        heard, reply, ok, changed, command = "", "", False, False, None
+        heard, reply, ok, changed, command, previewing = "", "", False, False, None, False
         # The headset sends the selected bodies' names as percent-encoded JSON.
         try:
             selected = json.loads(urllib.parse.unquote(self.headers.get("X-Selected", "") or "[]"))
@@ -1447,6 +1539,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise RuntimeError("I didn't catch that: hold the left trigger while you speak.")
             spent_before = spend.get("spent", 0.0)
             word = norm(heard)
+            # A change on show: "yes" applies it, "no" or "cancel" drops it, anything else drops it and is a new request.
+            if waiting["p"] is not None:
+                if word in GO_WORDS or word in APPLY_WORDS:
+                    reply, changed = preview_apply()
+                    log(f"spoken apply: {reply}")
+                    self.reply_json({"heard": heard, "reply": reply, "ok": True, "changed": changed})
+                    return
+                dropped = preview_cancel()
+                if word in STOP_WORDS or CANCEL_END.search(heard):
+                    log(f"spoken drop: {dropped}")
+                    self.reply_json({"heard": heard, "reply": dropped, "ok": True, "changed": False})
+                    return
             if pending["st"] is not None and word in GO_WORDS:
                 log("spoken OK to the waiting big request")
                 reply, changed, ok = resume_pending()
@@ -1484,6 +1588,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     if replayed:
                         reply, changed = replayed
+                    elif args.preview == "ai":
+                        # The AI's change is made inside a checkpoint and only shown: the wearer applies or drops it.
+                        def run():
+                            r, c = ask(heard, selected, pointed, faces, edges=edges)
+                            return r, c, list((last_ai["st"] or {}).get("steps") or [])
+                        reply, previewing = preview_of(heard, run)
+                        learn(heard, last_ai["st"], previewing)
+                        changed = False
                     else:
                         reply, changed = ask(heard, selected, pointed, faces, edges=edges)
                         learn(heard, last_ai["st"], changed)
@@ -1499,6 +1611,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out["cost"] = f"{spend.get('spent', 0.0) - spent_before:.4f}"
         if command:
             out["command"] = command
+        if ok and previewing:
+            out["preview"] = True
         if confirm_k():
             out["confirm_k"] = confirm_k()
             out["confirm_cost"] = f"{pending['st']['size'] / 1e6 * PRICE_IN:.4f}"  # about, for one more step
@@ -1586,7 +1700,7 @@ def beacon(port, quest):
         with lock:
             version, nv = state["version"], state["notes_version"]
         if version:
-            msg = f"SCVIEW1 {port} {version} n{nv} b{balance_text()}".encode()
+            msg = f"SCVIEW1 {port} {version} n{nv} b{balance_text()} p{1 if state.get('preview') else 0}".encode()
             for addr in ["255.255.255.255"] + ([quest] if quest else []):
                 try:
                     s.sendto(msg, (addr, BEACON_PORT))
@@ -1738,6 +1852,9 @@ def main():
                     help="an AI request is stopped when it grows past this many tokens (default 120000)")
     ap.add_argument("--balance", type=float,
                     help="your API credit in dollars: the headset then shows what is left, estimated from what this server spends")
+    ap.add_argument("--preview", choices=["off", "ai"], default=os.environ.get("SCVIEW_PREVIEW") or "ai",
+                    help="ai (default): a change the AI makes is only shown, and made when the wearer applies it; "
+                         "off: made at once, as before")
     ap.add_argument("--no-direct", action="store_true",
                     help="send every request to the AI, even one that only sets a parameter or dimension")
     ap.add_argument("--ai", choices=["anthropic", "ollama"], default=os.environ.get("SCVIEW_AI") or "anthropic",
