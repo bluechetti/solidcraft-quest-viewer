@@ -43,7 +43,7 @@ impl Tab {
         match self {
             Tab::Select => &[Button::Faces, Button::Hide, Button::Isolate, Button::ShowAll],
             Tab::View => &[Button::Room, Button::Edges, Button::Explode, Button::Guides, Button::Recentre],
-            Tab::Tools => &[Button::Section, Button::Measure, Button::PushPull, Button::Place, Button::Size, Button::Dims, Button::Features, Button::Handles, Button::Move],
+            Tab::Tools => &[Button::Section, Button::Measure, Button::PushPull, Button::Place, Button::Size, Button::Dims, Button::Features, Button::Handles, Button::Move, Button::Clash],
             Tab::Notes => &[Button::Note, Button::DoNotes, Button::DeleteNote, Button::Repeat, Button::SaveReq, Button::Saved],
             Tab::More => &[Button::Models, Button::Keys, Button::Keyboard, Button::SaveFile, Button::Snap],
         }
@@ -146,6 +146,7 @@ pub fn icon_of(b: Button) -> &'static Icon {
         Button::Features => &icons::LIST,
         Button::Handles => &icons::PUSH_PULL,
         Button::Move => &icons::RECENTRE,
+        Button::Clash => &icons::SECTION,
         Button::ConfirmGo => &icons::CHECK,
         Button::ConfirmStop => &icons::CLEAR,
         Button::CancelVoice => &icons::CLEAR,

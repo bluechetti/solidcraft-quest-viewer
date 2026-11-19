@@ -51,6 +51,8 @@ const SELECT_TINT: [f32; 4] = [1.0, 0.55, 0.1, 0.25];
 const SELECT_EDGE_TINT: [f32; 4] = [1.0, 0.5, 0.05, 1.0];
 /// The whole model while it is a preview of a change not made yet: clearly green.
 const PREVIEW_TINT: [f32; 4] = [0.2, 0.95, 0.4, 0.55];
+/// Parts the interference check found overlapping.
+const CLASH_TINT: [f32; 4] = [1.0, 0.12, 0.1, 0.6];
 
 type M4 = [f32; 16];
 
@@ -725,6 +727,7 @@ enum Button {
     Features,
     Handles,
     Move,
+    Clash,
     ConfirmGo,
     ConfirmStop,
     CancelVoice,
@@ -937,6 +940,8 @@ struct PanelState {
     handles: bool,
     /// The trigger moves parts.
     moving: bool,
+    /// Overlapping parts are marked.
+    clash: bool,
     overlay: Overlay,
     /// The overlay row the pointer is on.
     overlay_hover: Option<usize>,
@@ -983,6 +988,12 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Keep (save) the last request to repeat"
             }
         }
+        Button::Clash => match (st.clash, short) {
+            (true, true) => "No marks",
+            (false, true) => "Overlaps",
+            (true, false) => "Take the red marks off",
+            (false, false) => "Check which parts overlap: they turn red and are selected",
+        },
         Button::Move => match (st.moving, short) {
             (true, true) => "Stop move",
             (false, true) => "Move",
@@ -1201,6 +1212,7 @@ fn active(b: Button, st: &PanelState) -> bool {
         Button::Features => st.overlay == Overlay::Features,
         Button::Handles => st.handles,
         Button::Move => st.moving,
+        Button::Clash => st.clash,
         Button::Reply => st.overlay == Overlay::Reply,
         Button::Keyboard => st.kb_open,
         Button::Section => st.section == Section::Moving,
@@ -2867,6 +2879,7 @@ fn run(app: &Host) {
         // a scale brought near real size snaps to it.
         let debug_ray = std::env::var_os("SCVIEW_DEBUG_RAY").is_some();
         let mut debug_ray_n = 0u32;
+        let mut debug_handle_n = 0u32;
         let mut debug_state_n = 0u32;
         let mut hidden_sent: Vec<bool> = Vec::new();
         let mut grab = svr::grab::WorldGrab::default();
@@ -3329,6 +3342,7 @@ fn run(app: &Host) {
                 voice::fetch_history();
                 voice::fetch_explodes();
                 voice::fetch_handles();
+                voice::clear_clash();
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -3339,6 +3353,7 @@ fn run(app: &Host) {
                 }
             }
             // Each body's move away from the model's centre (model units); empty when assembled.
+            let clash_names: Vec<String> = voice::CLASH.lock().map(|c| c.clone()).unwrap_or_default();
             let offsets: Vec<[f32; 3]> = if explode > 0.0 {
                 let bb = scene.bounds();
                 let c = [0, 1, 2].map(|k| (bb[k] + bb[k + 3]) * 0.5);
@@ -3824,17 +3839,29 @@ fn run(app: &Host) {
             handle_hover = None;
             if let (Some((pm, _)), None, false, false) = (ray, &handle_drag, on_panel, on_kb) {
                 let (o, d) = ([pm[12], pm[13], pm[14]], normalize([-pm[8], -pm[9], -pm[10]]));
-                let mut best = 0.03f32; // the pointer within 3 cm of the arrow's head
+                let mut best = f32::MAX; // the pointer must be within 3 cm of the arrow's head
+                // For test scripts: now and then, how far each arrow's head is from the ray, to the pointer's
+                // right and upward (metres), so a script can steer onto one by name.
+                let mut where_log: Vec<String> = Vec::new();
+                debug_handle_n = debug_handle_n.wrapping_add(1);
                 for (i, h) in handle_list.iter().enumerate() {
                     let tip = transform(&model, [0, 1, 2].map(|k| h.at[k] + h.dir[k] * handle_len), 1.0);
                     let v = sub(tip, o);
+                    if debug_ray && debug_handle_n % 20 == 0 {
+                        where_log.push(format!("{}@{:.4},{:.4}", h.label.replace(' ', "_"), dot(v, [pm[0], pm[1], pm[2]]), dot(v, [pm[4], pm[5], pm[6]])));
+                    }
                     let t = dot(v, d);
                     let off_ray = sub(v, d.map(|x| x * t));
                     let dist = dot(off_ray, off_ray).sqrt();
-                    if t > 0.0 && dist < best {
-                        best = dist;
+                    // Of two arrows that line up from here, the nearer one is taken.
+                    let score = dist + 0.02 * t;
+                    if t > 0.0 && dist < 0.03 && score < best {
+                        best = score;
                         handle_hover = Some(i);
                     }
+                }
+                if !where_log.is_empty() {
+                    log::info!("HANDLERAY {}", where_log.join(";"));
                 }
             }
             if let Some((i, ref mut drag, hand0, dir_w, ref mut value)) = handle_drag {
@@ -3844,7 +3871,12 @@ fn run(app: &Host) {
                         let fine = held[1];
                         let step = pp_step(unit) as f64;
                         let moved = svr::precise::snap(drag.update(along, fine), if fine { svr::precise::fine_step(step, 0.1) } else { step });
-                        let now = (h.value + h.gain * moved as f32).max(0.1);
+                        let mut now = h.value + h.gain * moved as f32;
+                        if h.id.starts_with("joint:") {
+                            // Whole degrees or millimetres; tenths with the grip.
+                            now = if fine { (now * 10.0).round() / 10.0 } else { now.round() };
+                        }
+                        let now = now.clamp(h.min, h.max);
                         if (now - *value).abs() > 1e-4 {
                             *value = now;
                             voice::say(&format!("{}: {} {}", h.label, fmt_dim(now), h.unit));
@@ -3890,7 +3922,7 @@ fn run(app: &Host) {
                     match (hovered.filter(|&t| t != b), hit_point) {
                         (Some(t), Some(p)) => {
                             log::info!("move {name}: set on {} at {:?}", scene.bodies[t].name, sub(p, off(t)));
-                            voice::move_part(name, by, Some((grab, sub(p, off(t)))));
+                            voice::move_part(name, by, Some((grab, sub(p, off(t)), hit_normal)));
                         }
                         _ if by.iter().any(|v| v.abs() > 1e-4) => {
                             log::info!("move {name}: by {by:?} mm");
@@ -4013,7 +4045,8 @@ fn run(app: &Host) {
                             let side = PANEL_W / 2.0 - overlay_x;
                             let dir = if side < DIM_ZONE { 1.0 } else if side < DIM_ZONE * 2.0 { -1.0 } else { 0.0 };
                             if dir != 0.0 {
-                                let value = dim_step_to(d.value, dir);
+                                // A joint moves 5 (degrees or mm) a press, from wherever it is, zero included.
+                                let value = if d.id.starts_with("joint:") { ((d.value / 5.0 + dir * 1.001).round()) * 5.0 } else { dim_step_to(d.value, dir) };
                                 log::info!("dimension {} ({}): {} -> {}", d.label, d.id, d.value, value);
                                 voice::set_dim(&d.id, value);
                             }
@@ -4088,6 +4121,13 @@ fn run(app: &Host) {
                             Button::ConfirmStop => voice::cancel_confirm(),
                             Button::Repeat => voice::repeat_last(),
                             Button::SaveReq => voice::save_last(),
+                            Button::Clash => {
+                                if clash_names.is_empty() {
+                                    voice::check_clash();
+                                } else {
+                                    voice::clear_clash();
+                                }
+                            }
                             Button::Move => {
                                 moving = !moving;
                                 if moving {
@@ -4726,6 +4766,8 @@ fn run(app: &Host) {
             for (i, b) in scene.bodies.iter().enumerate() {
                 let tint = if hidden[i] {
                     None
+                } else if clash_names.iter().any(|n| *n == b.name) {
+                    Some(CLASH_TINT)
                 } else if selected[i] {
                     Some(SELECT_TINT)
                 } else if Some(i) == hovered && !edge_mode && !face_mode && !pushing {
@@ -4972,7 +5014,7 @@ fn run(app: &Host) {
                     if debug_state_n % 6 == 0 {
                         let names = |v: &Vec<bool>| scene.bodies.iter().zip(v).filter(|(_, &on)| on).map(|(b, _)| b.name.as_str()).collect::<Vec<_>>().join(",");
                         log::info!(
-                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={}",
+                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={} clash=[{}]",
                             hovered.map_or("-", |i| scene.bodies[i].name.as_str()),
                             names(&selected),
                             selected_faces.len(),
@@ -4990,11 +5032,12 @@ fn run(app: &Host) {
                             handle_hover.and_then(|i| handle_list.get(i)).map_or("-".to_string(), |h| h.label.replace(' ', "_")),
                             handle_drag.as_ref().map_or("-".to_string(), |d| format!("{}", d.4)),
                             moving,
-                            move_drag.as_ref().map_or("-".to_string(), |d| format!("{}:{},{},{}", scene.bodies[d.0].name, d.4[0], d.4[1], d.4[2]))
+                            move_drag.as_ref().map_or("-".to_string(), |d| format!("{}:{},{},{}", scene.bodies[d.0].name, d.4[0], d.4[1], d.4[2])),
+                            clash_names.join(",")
                         );
                     }
                 }
-                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, feat_page, handles: handles_on, moving, overlay, overlay_hover };
+                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, feat_page, handles: handles_on, moving, clash: !clash_names.is_empty(), overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
                 let ni = ui.indices.len().min(UI_MAX_INDICES) / 6 * 6;

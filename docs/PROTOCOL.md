@@ -137,12 +137,18 @@ Not in David's published server; described here so another client can use them. 
 | `GET /history.txt` | `u` or `r` `\t` the change's words, newest first | What Undo and Redo would do next. |
 | `GET /features.txt` | `id \t name \t type \t off (0/1) \t error` | The design's timeline, in order. |
 | `GET /explodes.txt` | `id \t name \t on show (0/1)` | SolidCraft's own exploded views; empty when the design has none. |
-| `GET /handles.txt` | `id \t label \t value \t unit \t x \t y \t z \t dx \t dy \t dz \t gain \t body` | A place on the model for each dimension that has one: a box's three sizes, a cylinder's height and radius, a hole's diameter. The point and direction are in model units; a move of 1 along the direction adds `gain` to the value (2 for a diameter). `id` goes to `/dimension`. |
+| `GET /handles.txt` | `id \t label \t value \t unit \t x \t y \t z \t dx \t dy \t dz \t gain \t body \t min \t max` | A place on the model for each dimension that has one: a box's three sizes, a cylinder's height and radius, a hole's diameter, the distance of a sketch extruded into its own body, and each joint (a slider along its axis; a hinge at the turning part's far edge, `gain` in degrees per unit). `min` and `max` are the value's limits, `-` for none. The point and direction are in model units; a move of 1 along the direction adds `gain` to the value (2 for a diameter). `id` goes to `/dimension`. |
 | `POST /feature` | `X-Id`: id or name; `X-Suppress`: `1` off, `0` on, absent to toggle | One undo step. |
 | `POST /explode` | `X-View`: a view's name, `none` for assembled, absent for the next in turn | The mesh on show changes; the design does not. |
 | `POST /visibility` | `X-Hidden`: JSON array of body names | What the wearer has hidden, for the AI's summary (`--sync-visibility` also sets SolidCraft's browser). |
-| `POST /move` | `X-Body`: name; then `X-Translate: dx \t dy \t dz`, or `X-From` and `X-To` (`x \t y \t z` each) | Moves one body by a distance, or sets it on another part: the point it was held by onto the point let go over, face to face when both are flat faces. One undo step. |
+| `POST /move` | `X-Body`: name; then `X-Translate: dx \t dy \t dz`, or `X-From`, `X-To` (`x \t y \t z` each) and optionally `X-Normal` | Moves one body by a distance, or sets it on another part at `X-To`. With `X-Normal` (the outward direction of the face there) the part's opposite side lands: it is moved, not turned, until the middle of that side touches the point. Without it: the point it was held by onto the point let go over. One undo step. |
+| `POST /interference` | Reply adds `clashes` (a count) and, when there are any, `select` (the bodies involved, joined by `\x1f`) | SolidCraft's interference check on the design as it stands. Changes nothing. |
+| `GET /clashes.txt` | `body a \t body b \t volume mm3 \t x \t y \t z \t part a \t part b` | The last check's pairs, with the middle of each overlap. |
 | `POST /preview/apply`, `/preview/cancel` | | With `--preview ai` (the default) an AI change is shown first; these keep it or drop it. The beacon's `p1` field says a preview is on show. |
 
 A reply to `/ask` may also carry `"command": "<id>"` (a viewer command from `tools/commands.tsv` that the
 words named, done by the viewer itself) or `"select"` (body names joined by `\x1f`, to select).
+
+Joints are in `/dimensions.txt` with kind `joint` and ids `joint:<id>` ("Hinge angle" in deg, "Slide distance"
+in mm), ahead of the parameters, and are set through `/dimension` like any other: SolidCraft holds a value at
+the joint's limits and the reply says so.

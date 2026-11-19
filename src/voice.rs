@@ -739,7 +739,7 @@ pub fn set_dims_of(feature: &str) {
 
 /// Moves a part on the Mac (POST /move, no AI). `onto`: the point it was taken hold of and the point on
 /// another part it was let go over, when it should be set on that face; else it moves by `by` (model units).
-pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3])>) {
+pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3], [f32; 3])>) {
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -747,7 +747,9 @@ pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3])>)
     std::thread::spawn(move || {
         let p = |v: [f32; 3]| format!("{}\t{}\t{}", v[0], v[1], v[2]);
         let extra = match onto {
-            Some((from, to)) => format!("X-Body: {}\r\nX-From: {}\r\nX-To: {}\r\n", percent(&body), percent(&p(from)), percent(&p(to))),
+            Some((from, to, n)) => {
+                format!("X-Body: {}\r\nX-From: {}\r\nX-To: {}\r\nX-Normal: {}\r\n", percent(&body), percent(&p(from)), percent(&p(to)), percent(&p(n)))
+            }
             None => format!("X-Body: {}\r\nX-Translate: {}\r\n", percent(&body), percent(&p(by))),
         };
         match post_typed("/move", b"", "text/plain", 120, &extra) {
@@ -763,6 +765,38 @@ pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3])>)
     });
 }
 
+/// The bodies the last interference check found overlapping (empty: none, or not checked).
+pub static CLASH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Forget the last check (the model changed, or the wearer switched the marks off).
+pub fn clear_clash() {
+    if let Ok(mut c) = CLASH.lock() {
+        c.clear();
+    }
+}
+
+/// Asks the Mac which parts overlap (POST /interference). The bodies found are marked and selected, so
+/// Isolate shows only those; the reply names the pairs and their overlap.
+pub fn check_clash() {
+    set_status("Checking for overlaps...", Some(""), Some(""));
+    std::thread::spawn(|| match post_typed("/interference", b"", "text/plain", 120, "") {
+        Ok(json) => {
+            let names: Vec<String> = json_string(&json, "select").map(|s| s.split('\u{1f}').map(str::to_string).collect()).unwrap_or_default();
+            log::info!("clash: {} bodies overlap: {}", names.len(), json_string(&json, "reply").unwrap_or_default());
+            if let Ok(mut c) = CLASH.lock() {
+                *c = names.clone();
+            }
+            if !names.is_empty() {
+                if let Ok(mut q) = SELECT_IN.lock() {
+                    *q = Some(names);
+                }
+            }
+            set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+        }
+        Err(e) => set_status("", None, Some(&e)),
+    });
+}
+
 /// A dimension's handle on the model (GET /handles.txt): where it is, the way it moves, and what a move of
 /// one model unit adds to the value (2 for a diameter taken hold of at its rim).
 #[derive(Clone)]
@@ -774,6 +808,9 @@ pub struct Handle {
     pub at: [f32; 3],
     pub dir: [f32; 3],
     pub gain: f32,
+    /// The least and most the value may be (a joint's limits; a size stays above 0.1).
+    pub min: f32,
+    pub max: f32,
 }
 
 /// The handles of the model on show (empty until fetched, or when the design has none).
@@ -792,7 +829,7 @@ pub fn fetch_handles() {
                         return None;
                     }
                     let n = |i: usize| f[i].parse::<f32>().ok();
-                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)? })
+                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)?, min: f.get(12).and_then(|v| v.parse().ok()).unwrap_or(if f.len() > 12 { f32::NEG_INFINITY } else { 0.1 }), max: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(f32::INFINITY) })
                 })
                 .collect();
             log::info!("handles: {} on the model", list.len());

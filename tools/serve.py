@@ -28,6 +28,7 @@ place "here" refers to; done notes are marked "done" with the AI's reply. The he
 notes from /comments.txt; the beacon's 4th field is the notes version.
 """
 import argparse
+import math
 import hmac
 import secrets
 import shutil
@@ -968,13 +969,93 @@ def key_of(text):
     return re.sub(r"[^a-z0-9]+", "", str(text).lower())
 
 
+# --- joints: an assembly's moving connections, driven like dimensions ---
+
+def joints():
+    """The design's joints that can move, as [{"id", "name", "type", "value", "unit", "min", "max", "a", "b",
+    "origin", "z"}] (a, b: the occurrences joined; origin and z: the joint's place and axis in the model).
+    One value each: a hinge's angle, a slider's distance. Empty for a design without joints."""
+    text, err = session.call("execute", {"command": "joint.list", "params": {}})
+    if err:
+        return []
+    out = []
+    for j in json.loads(text).get("joints", []):
+        if j.get("suppressed") or not j.get("values"):
+            continue
+        v, lim, frame = j["values"][0], j["values"][0].get("limits") or [None, None], j.get("frame_b") or j.get("frame_a") or {}
+        out.append({"id": j["id"], "name": j["name"], "type": j["type"], "what": v["name"], "value": round(v["value"], 4), "unit": v["unit"],
+                    "min": lim[0], "max": lim[1], "a": j.get("a"), "b": j.get("b"), "origin": frame.get("origin"), "z": frame.get("z")})
+    return out
+
+
+def set_joint(dim, value):
+    """Drive a joint to a value (deg or mm): (reply, changed). One undo step. SolidCraft holds it at a limit."""
+    assembled()
+    before = undo_depth()
+    text, err = session.call("execute", {"command": "joint.drive", "params": {"joint": dim["joint"], "value": float(value), "quiet": True}})
+    log(f"joint: {dim['label']} = {value!r} -> {'ERROR ' if err else ''}{text[:200]}")
+    if err:
+        return f"SolidCraft could not move {dim['feature']}: {text[:120]}", False
+    r = json.loads(text)
+    now = round(r["values"][0]["value"], 4)
+    if now == dim["value"]:
+        if before is not None and (undo_depth() or 0) > before:
+            session.call("undo", {})
+        held = (r.get("held") or [{}])[0].get("why") or r.get("reason") or "it cannot move"
+        return f"{dim['feature']} stays at {now:g} {dim['unit']}: {held}.", False
+    ai_redo.clear()
+    if before is not None:
+        ai_undo.append((before, f"{dim['label']} = {now:g}"))
+    held = (r.get("held") or [{}])[0].get("why")
+    return f"{dim['label']} is now {now:g} {dim['unit']} (was {dim['value']:g})" + (f": {held}." if held else "."), True
+
+
+def occurrence_bodies():
+    """{occurrence id: [its bodies' names]}."""
+    text, err = session.call("execute", {"command": "assembly.mass_properties", "params": {}})
+    return {} if err else {o["occurrence"]: [b["name"] for b in o.get("bodies", [])] for o in json.loads(text).get("occurrences", [])}
+
+
+# --- interference: which parts overlap ---
+
+clashes = []   # the last check's pairs: {"a", "b", "volume", "center", "a_part", "b_part"}
+
+
+def check_clashes():
+    """Run SolidCraft's interference check on the design as it stands: (reply, the pairs). Changes nothing."""
+    global clashes
+    text, err = session.call("execute", {"command": "inspect.interference", "params": {"budget_s": 60}})
+    if err:
+        clashes = []
+        return f"SolidCraft could not check: {text[:120]}", []
+    r = json.loads(text)
+    part = lambda p, body: (p or {}).get("component") or body
+    clashes = [{"a": i["a"], "b": i["b"], "volume": i.get("volume_mm3", 0.0), "center": i.get("center") or [0, 0, 0],
+                "a_part": part(i.get("a_part"), i["a"]), "b_part": part(i.get("b_part"), i["b"])} for i in r.get("interferences", [])]
+    log(f"interference: {len(clashes)} pair(s) of {r.get('checked', '?')} bodies in {r.get('ms', 0):.0f} ms")
+    unchecked = len(r.get("unchecked") or [])
+    tail = f" {unchecked} pair(s) not checked in time." if unchecked else ""
+    if not clashes:
+        return f"No parts overlap ({r.get('checked', '?')} bodies checked).{tail}", []
+    said = "; ".join(f"{c['a_part']} and {c['b_part']} by {c['volume']:.0f} mm3" for c in clashes[:3])
+    more = f"; and {len(clashes) - 3} more" if len(clashes) > 3 else ""
+    return f"{len(clashes)} overlap{'s' if len(clashes) != 1 else ''}: {said}{more}.{tail}", clashes
+
+
+def clashes_text():
+    """For the headset, the last check's pairs: body a, body b, volume (mm3), centre x y z, part a, part b."""
+    return "".join("\t".join([c["a"], c["b"], f"{c['volume']:.3f}", *(f"{x:.3f}" for x in c["center"]), c["a_part"], c["b_part"]]) + "\n" for c in clashes).encode()
+
+
 def dimensions():
-    """Everything that can be set directly: user parameters (by name) and feature inputs ("Hole1 Diameter"),
-    as {"id", "label", "value", "unit", "expression", "kind", "feature", "input"}."""
+    """Everything that can be set directly: joints first ("Hinge angle"), then user parameters (by name) and
+    feature inputs ("Hole1 Diameter"), as {"id", "label", "value", "unit", "expression", "kind", "feature",
+    "input"}; kind is joint, user, feature or sketch."""
     text, err = session.call("execute", {"command": "parameters.list", "params": {"filter": "all"}})
     if err:
         raise RuntimeError(text[:200])
-    out = []
+    out = [{"id": f"joint:{j['id']}", "label": f"{j['name']} {j['what']}", "value": j["value"], "unit": j["unit"], "expression": "", "kind": "joint",
+            "feature": j["name"], "input": None, "joint": j["id"]} for j in joints()]
     for q in json.loads(text).get("parameters", []):
         feature, inp = q.get("feature"), q.get("input")
         label = q["name"] if q.get("source") == "user" or not (feature and inp) else f"{feature} {inp}"
@@ -1016,6 +1097,11 @@ UNITS = {"mm": "", "millimeter": "", "millimetre": "", "cm": " cm", "centimeter"
 def set_dimension(dim, value, why=""):
     """Set one dimension (a number in its own unit, or an expression). (reply, changed). A value that breaks
     a feature is taken back."""
+    if dim.get("kind") == "joint":
+        try:
+            return set_joint(dim, float(value))
+        except (TypeError, ValueError):
+            return f"{dim['label']} needs a number.", False
     assembled()
     before = undo_depth()
     text, err = session.call("set_parameter", {"name": dim["id"], "value": value})
@@ -1104,16 +1190,37 @@ def set_suppressed(feature, off):
 
 # --- moving a part: by a distance, or onto a face of another part ---
 
-def move_body(body, translate=None, frm=None, to=None):
+def body_bbox(body):
+    for b in json.loads(session.call("measure", {"summary": True})[0]).get("bodies", []):
+        if b["name"] == body:
+            return b["bbox"]["min"], b["bbox"]["max"]
+    return None
+
+
+def move_body(body, translate=None, frm=None, to=None, normal=None):
     """Move one body, as one undo step: (reply, changed). With `frm` and `to` (model points: where the part
-    was taken hold of, and where on another part it was let go) the part is set there with SolidCraft's
-    align: the face it was held by onto the face pointed at, or the point onto the point when the part was
-    not held by a flat face. Else it moves by `translate`."""
+    was taken hold of, and where on another part it was let go) the part is set there. With `normal` (the
+    outward direction of the face let go over) the part's own side that faces the other way is what lands:
+    the part is moved, without turning, until the middle of that side touches the point. Without `normal`: the face it
+    was held by onto the face pointed at, or point onto point. Else it moves by `translate`."""
     assembled()
     if body not in all_body_names():
         return f"No part is called \"{body}\".", False
     before = undo_depth()
-    if frm and to:
+    bb = body_bbox(body) if (to and normal) else None
+    if to and normal and bb:
+        k = max(range(3), key=lambda j: abs(normal[j]))      # the model axis the face looks along
+        lo, hi = bb
+        side = [(a + b) / 2 for a, b in zip(lo, hi)]
+        side[k] = lo[k] if normal[k] > 0 else hi[k]          # the middle of the part's side that will land
+        # Moved, not turned. (SolidCraft's align from a point on that side was tried: it takes the nearest
+        # flat face it finds, which for a round side is some other face, and the part ends up askew.)
+        t = [round(to[j] - side[j], 4) for j in range(3)]
+        text, err = session.call("execute", {"command": "solid.move", "params": {"bodies": [body], "translate": t}})
+        how = "touching the face, not turned"
+        label = f"set {body} on another part"
+        reply = f"{body} set there ({how})."
+    elif frm and to:
         text, err = session.call("execute", {"command": "solid.align", "params": {"bodies": [body], "from_face": frm, "to_face": to}})
         how = "face to face"
         if err:
@@ -1140,7 +1247,7 @@ def move_body(body, translate=None, frm=None, to=None):
 def handles():
     """A handle for each dimension that has an obvious place on the model: a box's three sizes (the middle of
     its +X, +Y and +Z faces), a cylinder's height (its far end) and radius (its side), a hole's diameter
-    (its rim). Each is {"id", "label", "value", "unit", "at" (model point), "dir" (unit vector the handle
+    (its rim), the distance of a sketch extruded into its own body (its far end). Each is {"id", "label", "value", "unit", "at" (model point), "dir" (unit vector the handle
     moves along), "gain" (what a move of 1 adds to the value: 2 for a diameter), "body"}.
     The id is what set_dimension takes: the user parameter when the feature's size is just that parameter
     (so the design stays driven by it, and everything else that uses it follows), else the feature's own."""
@@ -1167,7 +1274,7 @@ def handles():
             driven_by = i["expression"].strip() if i["expression"].strip() in users else None
             target = dims[driven_by] if driven_by else own
             out.append({"id": target["id"], "label": f"{f['name']} {label}" + (f" ({driven_by})" if driven_by else ""), "value": own["value"],
-                        "unit": own["unit"], "at": [round(x, 4) for x in at], "dir": direction, "gain": gain, "body": body or ""})
+                        "unit": own["unit"], "at": [round(x, 4) for x in at], "dir": direction, "gain": gain, "body": body or "", "min": 0.1, "max": None})
 
         kind = info.get("type")
         body = (d.get("body_names") or d.get("participants") or [None])[0]
@@ -1191,6 +1298,21 @@ def handles():
             at = list(mid)
             at[side] = hi[side]
             handle("Radius", at, [1.0 if j == side else 0.0 for j in range(3)], 1.0, body)
+        elif kind == "extrude" and bb and d.get("operation") == "new_body":
+            # A sketch on one of the origin planes, extruded into a body of its own: the far end of the body
+            # along the plane's normal. (A join or a cut has no body of its own to find the end of.)
+            plane = {}
+            if isinstance(d.get("sketch"), int):
+                text, err = session.call("execute", {"command": "timeline.inspect", "params": {"feature": d["sketch"]}})
+                plane = {} if err else json.loads(text).get("definition", {}).get("plane", {})
+            k = {"YZ": 0, "XZ": 1, "XY": 2}.get(plane.get("name")) if plane.get("type") == "origin" else None
+            ext = d.get("extent", {})
+            if k is not None and ext.get("convention") == "total_distance" and ext.get("direction") in ("positive", "negative"):
+                sign = 1.0 if ext["direction"] == "positive" else -1.0
+                lo, hi = bb["min"], bb["max"]
+                at = [(a + b) / 2 for a, b in zip(lo, hi)]
+                at[k] = hi[k] if sign > 0 else lo[k]
+                handle("Distance", at, [sign if j == k else 0.0 for j in range(3)], 1.0, body)
         elif kind == "hole":
             pos = d.get("position")
             direction = [float(x) for x in d.get("direction", [0, 0, -1])]
@@ -1199,16 +1321,44 @@ def handles():
                 side = (k + 1) % 3
                 perp = [1.0 if j == side else 0.0 for j in range(3)]
                 handle("Diameter", add(pos, perp, dims[inputs["Diameter"]["param"]]["value"] / 2), perp, 2.0, body)
+    # Joints: a slider's handle is on its axis and moves along it; a hinge's is at the far edge of the part
+    # that turns and moves the way that edge swings (so many degrees for each unit moved).
+    js = joints()
+    of = occurrence_bodies() if js else {}
+    for j in js:
+        if not (j["origin"] and j["z"]):
+            continue
+        o, z = j["origin"], j["z"]
+        body = next(iter(of.get(j["b"], [])), None)
+        bb = boxes.get(body)
+        base = {"id": f"joint:{j['id']}", "label": f"{j['name']} {j['what']}", "value": j["value"], "unit": j["unit"], "body": body or "", "min": j["min"], "max": j["max"]}
+        if j["type"] == "slider" and bb:
+            top = [(a + b) / 2 for a, b in zip(bb["min"], bb["max"])]
+            k = max(range(3), key=lambda i: abs(z[i]))
+            top[k] = bb["max"][k] if z[k] > 0 else bb["min"][k]
+            top[(k + 1) % 3] = bb["min"][(k + 1) % 3]            # at the rim, clear of the part's own height handle
+            out.append(dict(base, at=[round(x, 4) for x in top], dir=[round(x, 6) for x in z], gain=1.0))
+        elif j["type"] == "revolute" and bb:
+            c = [(a + b) / 2 for a, b in zip(bb["min"], bb["max"])]
+            v = [c[i] - o[i] for i in range(3)]
+            along = sum(v[i] * z[i] for i in range(3))
+            r = [2 * (v[i] - along * z[i]) for i in range(3)]             # from the axis to the far edge
+            reach = math.sqrt(sum(x * x for x in r))
+            if reach < 1e-6:
+                continue
+            swing = [z[1] * r[2] - z[2] * r[1], z[2] * r[0] - z[0] * r[2], z[0] * r[1] - z[1] * r[0]]
+            out.append(dict(base, at=[round(o[i] + along * z[i] + r[i], 4) for i in range(3)], dir=[round(x / reach, 6) for x in swing], gain=round(180 / (math.pi * reach), 6)))
     return out
 
 
 def handles_text():
-    """For the headset, one handle per line: id, label, value, unit, at x y z, dir x y z, gain, body (tabs)."""
+    """For the headset, one handle per line: id, label, value, unit, at x y z, dir x y z, gain, body, and the
+    least and most the value may be ("-" for no limit), tab-separated."""
     if session is None:
         return b""
     try:
         return "".join("\t".join([h["id"], h["label"], f"{h['value']:g}", h["unit"], *(f"{x:g}" for x in h["at"]), *(f"{x:g}" for x in h["dir"]),
-                                  f"{h['gain']:g}", h["body"]]) + "\n" for h in handles()).encode()
+                                  f"{h['gain']:g}", h["body"], *("-" if h[k] is None else f"{h[k]:g}" for k in ("min", "max"))]) + "\n" for h in handles()).encode()
     except (RuntimeError, ValueError, KeyError) as e:
         log(f"handles: {e}")
         return b""
@@ -1461,8 +1611,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt", "/features.txt", "/handles.txt"):
-            out = {"/handles.txt": handles_text, "/features.txt": features_text, "/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
+        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt", "/features.txt", "/handles.txt", "/clashes.txt"):
+            out = {"/handles.txt": handles_text, "/clashes.txt": clashes_text, "/features.txt": features_text, "/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
                    "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines, "/explodes.txt": explodes_text}[self.path]()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1495,7 +1645,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
-                             "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move"):
+                             "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move", "/interference"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1631,16 +1781,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        if self.path == "/interference":
+            # Which parts overlap, as the design stands. The reply's "select" names the bodies involved (the
+            # headset selects them, so Isolate shows only those); /clashes.txt has the pairs.
+            reply, pairs = "Checking for overlaps needs a STEP or .sc source.", []
+            try:
+                if session is not None:
+                    reply, pairs = check_clashes()
+            except (RuntimeError, ValueError) as e:
+                reply = f"The check failed: {e}"
+            names = sorted({n for c in pairs for n in (c["a"], c["b"])})
+            self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False, "clashes": len(pairs), **({"select": "\x1f".join(names)} if names else {})})
+            return
         if self.path == "/move":
             # Move a part. X-Body: its name; X-Translate: "dx\tdy\tdz" in model units, or X-From and X-To
-            # ("x\ty\tz" each): the point it was held by and the point on another part to set it on.
+            # ("x\ty\tz" each): the point it was held by and the point on another part to set it on, with
+            # X-Normal (the outward direction of the face there) when the client knows it.
             reply, changed = "", False
             try:
                 if session is None:
                     raise RuntimeError("Moving parts needs a STEP or .sc source.")
                 vec = lambda name: [float(v) for v in urllib.parse.unquote(self.headers.get(name, "")).split("\t")] if self.headers.get(name) else None
                 body = urllib.parse.unquote(self.headers.get("X-Body", ""))
-                reply, changed = move_body(body, vec("X-Translate"), vec("X-From"), vec("X-To"))
+                reply, changed = move_body(body, vec("X-Translate"), vec("X-From"), vec("X-To"), vec("X-Normal"))
                 if changed:
                     export_scm()
             except (RuntimeError, ValueError) as e:
