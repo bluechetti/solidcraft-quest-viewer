@@ -28,6 +28,7 @@ mod icons;
 mod panel;
 mod raycast;
 mod scene;
+mod svr;
 mod voice;
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
@@ -162,6 +163,37 @@ fn view_matrix(pose: &xr::Posef) -> M4 {
 /// The matrix for a pose (rotation then translation).
 fn pose_matrix(pose: &xr::Posef) -> M4 {
     mul(&translate(pose.position.x, pose.position.y, pose.position.z), &quat_to_mat(pose.orientation))
+}
+
+/// An OpenXR pose as the shared grab's (svr) pose.
+fn svr_pose(p: &xr::Posef) -> svr::Pose {
+    svr::Pose {
+        position: [p.position.x as f64, p.position.y as f64, p.position.z as f64],
+        orientation: [p.orientation.x as f64, p.orientation.y as f64, p.orientation.z as f64, p.orientation.w as f64],
+    }
+}
+
+/// A model matrix (a turn, one scale and a move) as the shared grab's transform; `None` when it has no scale.
+fn m4_to_transform(m: &M4) -> Option<svr::room::Transform> {
+    let col = |c: usize| [m[c * 4] as f64, m[c * 4 + 1] as f64, m[c * 4 + 2] as f64];
+    let scale = svr::vector::length(col(0));
+    if !(scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let axes = [0, 1, 2].map(|c| svr::vector::scale(col(c), 1.0 / svr::vector::length(col(c)).max(1e-30)));
+    svr::room::Transform { axes, scale, translation: col(3), pivot: [0.0; 3] }.tidy()
+}
+
+/// The shared grab's transform as a model matrix.
+fn transform_to_m4(t: &svr::room::Transform) -> M4 {
+    let mut m = identity();
+    for c in 0..3 {
+        for r in 0..3 {
+            m[c * 4 + r] = (t.axes[c][r] * t.scale) as f32;
+        }
+        m[12 + c] = t.translation[c] as f32;
+    }
+    m
 }
 
 /// Asymmetric projection from an OpenXR field of view, Vulkan clip space (y down, depth 0..1).
@@ -2626,11 +2658,11 @@ fn run(app: &Host) {
         let mut kb_drag: Option<([f32; 2], f32)> = None;
         let mut pp_drag: Option<(u32, usize, [f32; 3], [f32; 3], [f32; 3], [f32; 3], f32)> = None;
         let mut pick_ms_sum = 0.0f64;
-        enum Grab {
-            One { hand: usize, inv_hand0: M4, world0: M4 },
-            Two { mid0: [f32; 3], dist0: f32, world0: M4 },
-        }
-        let mut grab: Option<Grab> = None;
+        // Holding the model: SolidCraft's own world grab (svr::grab), so it handles here as in the desktop
+        // app's VR mode. One grip carries it, both grips scale it about the point between the hands, and
+        // a scale brought near real size snaps to it.
+        let mut grab = svr::grab::WorldGrab::default();
+        let mut at_real_size = false;
         // Once the model has been handled it stays where it was put (no more auto-turning).
         let mut world: Option<M4> = None;
         let mut recentre_was = false;
@@ -2771,7 +2803,7 @@ fn run(app: &Host) {
                             if unfocused_since.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
                                 log::info!("focus back after {:.0} s: re-placing the model", unfocused_since.map_or(0.0, |t| t.elapsed().as_secs_f32()));
                                 world = None;
-                                grab = None;
+                                grab.release();
                             }
                             unfocused_since = None;
                         } else if unfocused_since.is_none() {
@@ -2795,7 +2827,7 @@ fn run(app: &Host) {
                         log::info!("reference space changed: re-placing the model");
                         need_anchor = true;
                         world = None;
-                        grab = None;
+                        grab.release();
                     }
                     other => log::info!("xr event {}", match other { VisibilityMaskChangedKHR(_) => "visibility mask", ReferenceSpaceChangePending(_) => "ref space change", EventsLost(_) => "events lost", InteractionProfileChanged(_) => "interaction profile", _ => "other" }),
                 }
@@ -2949,46 +2981,35 @@ fn run(app: &Host) {
                 held[h] = hand[h].is_some() && squeeze.state(&session, hand_paths[h]).map(|st| st.current_state > 0.6).unwrap_or(false);
             }
             let pos = |p: &xr::Posef| [p.position.x, p.position.y, p.position.z];
-            match (held[0], held[1], hand[0], hand[1]) {
-                (true, true, Some(a), Some(b)) => {
-                    let (pa, pb) = (pos(&a), pos(&b));
-                    let mid = [(pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0, (pa[2] + pb[2]) / 2.0];
-                    let dist = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt().max(0.01);
-                    match &grab {
-                        Some(Grab::Two { mid0, dist0, world0 }) => {
-                            let k = dist / dist0;
-                            world = Some(mul(&translate(mid[0], mid[1], mid[2]), &mul(&scale(k), &mul(&translate(-mid0[0], -mid0[1], -mid0[2]), world0))));
-                        }
-                        _ => grab = Some(Grab::Two { mid0: mid, dist0: dist, world0: cur }),
+            let grips = [0, 1].map(|h| if held[h] { hand[h].map(|p| svr_pose(&p)) } else { None });
+            if grips.iter().any(Option::is_some) {
+                // The whole model matrix (model units to the room's metres) is what the hands hold; the
+                // viewer keeps it as world * model_inner, so the result is taken apart again.
+                if let Some(full) = m4_to_transform(&mul(&cur, &model_inner)) {
+                    let moved = grab.update(&full, grips);
+                    if moved != full {
+                        world = Some(mul(&transform_to_m4(&moved), &invert(&model_inner)));
                     }
-                }
-                _ => {
-                    let one = if held[1] { Some(1) } else if held[0] { Some(0) } else { None };
-                    match one {
-                        Some(h) => {
-                            if let Some(pose) = hand[h] {
-                                match &grab {
-                                    Some(Grab::One { hand: gh, inv_hand0, world0 }) if *gh == h => {
-                                        world = Some(mul(&pose_matrix(&pose), &mul(inv_hand0, world0)));
-                                    }
-                                    _ => grab = Some(Grab::One { hand: h, inv_hand0: view_matrix(&pose), world0: cur }),
-                                }
-                            }
-                        }
-                        None => grab = None,
+                    let real = moved.scale == svr::room::REAL_SIZE;
+                    if real && !at_real_size && held[0] && held[1] {
+                        log::info!("grab: snapped to real size");
+                        voice::say("Real size (1:1).");
                     }
+                    at_real_size = real;
                 }
+            } else {
+                grab.release();
             }
-            let mode = match &grab {
-                None => "none".to_string(),
-                Some(Grab::One { hand: h, .. }) => format!("one ({})", if *h == 0 { "left" } else { "right" }),
-                Some(Grab::Two { .. }) => "two".to_string(),
+            let mode = match (grab.holding(), held[0], held[1]) {
+                (false, ..) => "none".to_string(),
+                (true, true, true) => "two".to_string(),
+                (true, l, _) => format!("one ({})", if l { "left" } else { "right" }),
             };
             if mode != grab_mode {
                 log::info!("grab {mode}; held L {} R {}, tracked L {} R {}", held[0], held[1], hand[0].is_some(), hand[1].is_some());
                 grab_mode = mode;
             }
-            if grab.is_none() {
+            if !grab.holding() {
                 if let Ok(st) = stick.state(&session, hand_paths[1]) {
                     let v = st.current_state;
                     if st.is_active && (v.x.abs() > 0.2 || v.y.abs() > 0.2) {
@@ -3026,7 +3047,7 @@ fn run(app: &Host) {
             }
             // Mouse: right-button drag turns the model about its centre (left/right about the vertical,
             // up/down tips it towards the wearer); the wheel zooms, except in push/pull, where it pulls a face.
-            if grab.is_none() && !views.is_empty() {
+            if !grab.holding() && !views.is_empty() {
                 let base = world.unwrap_or(cur);
                 let c = [base[12], base[13], base[14]];
                 let about_c = |m: &M4| mul(&translate(c[0], c[1], c[2]), &mul(m, &translate(-c[0], -c[1], -c[2])));
@@ -3042,7 +3063,7 @@ fn run(app: &Host) {
             let pressed = hand_paths.iter().any(|&h| recentre.state(&session, h).map(|st| st.current_state).unwrap_or(false));
             if pressed && !recentre_was {
                 world = None;
-                grab = None;
+                grab.release();
                 need_anchor = true;
                 anchor = None;
                 anchor_saved = None;
@@ -3062,7 +3083,7 @@ fn run(app: &Host) {
                 let w = mul(&pm, rel);
                 world = Some(w);
                 last_anchor_world = Some(w);
-                if grab.is_none() && anchor_saved != Some(*rel) && anchor_save_at.elapsed() > Duration::from_secs(2) {
+                if !grab.holding() && anchor_saved != Some(*rel) && anchor_save_at.elapsed() > Duration::from_secs(2) {
                     if let Some(f) = &placement_file {
                         scene::save_placement(f, rel);
                     }
@@ -3713,7 +3734,7 @@ fn run(app: &Host) {
                             }
                             Button::Recentre => {
                                 world = None;
-                                grab = None;
+                                grab.release();
                                 need_anchor = true;
                                 anchor = None;
                                 anchor_saved = None;
