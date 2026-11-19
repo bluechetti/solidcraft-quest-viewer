@@ -690,6 +690,54 @@ pub fn delete_saved(id: &str) {
     });
 }
 
+/// A parameter or feature dimension the Mac can set directly (GET /dimensions.txt).
+#[derive(Clone)]
+pub struct Dim {
+    pub id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: String,
+}
+
+/// The dimensions, once fetched (None: not yet).
+pub static DIMS: Mutex<Option<Vec<Dim>>> = Mutex::new(None);
+
+/// Fetches the dimensions (GET /dimensions.txt) in the background.
+pub fn fetch_dims() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else {
+            say("The Mac isn't running serve.py (no beacon seen).");
+            return;
+        };
+        match crate::http_get(mac, "/dimensions.txt", 10) {
+            Ok(b) => {
+                let list: Vec<Dim> = String::from_utf8_lossy(&b)
+                    .lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split('\t').collect();
+                        let value = f.get(2)?.parse().ok()?;
+                        Some(Dim { id: f[0].into(), label: f[1].into(), value, unit: f.get(3).unwrap_or(&"").to_string() })
+                    })
+                    .collect();
+                if let Ok(mut d) = DIMS.lock() {
+                    *d = Some(list);
+                }
+            }
+            Err(e) => say(&format!("Dimensions: {e}")),
+        }
+    });
+}
+
+/// Sets one dimension on the Mac (POST /dimension, no AI); the beacon's new version brings the changed model.
+pub fn set_dim(id: &str, value: f32) {
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let r = post_typed("/dimension", b"", "text/plain", 30, &format!("X-Name: {}\r\nX-Value: {}\r\n", percent(&id), value));
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+        fetch_dims();
+    });
+}
+
 /// Asks the AI again with the last request's words (the Mac repeats what it did before, without the AI, when it can).
 pub fn repeat_last() {
     let text = LAST_REQUEST.lock().map(|t| t.clone()).unwrap_or_default();

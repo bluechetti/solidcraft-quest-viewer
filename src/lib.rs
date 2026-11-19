@@ -718,6 +718,7 @@ enum Button {
     Repeat,
     SaveReq,
     Saved,
+    Dims,
     ConfirmGo,
     ConfirmStop,
     CancelVoice,
@@ -731,6 +732,24 @@ enum Guides {
     Off,
     Axes,
     Grid,
+}
+
+/// Width of each of the two targets (- and +) at the right end of a dimension's row.
+const DIM_ZONE: f32 = 0.022;
+
+/// A dimension's value one step down (dir -1) or up (+1): the step is a round number about a tenth of the
+/// value (60 goes by 5, 10 by 1, 6 by 0.5), and the result lands on a multiple of it.
+fn dim_step_to(value: f32, dir: f32) -> f32 {
+    let step = nice_step(value.abs() / 10.0).max(0.01);
+    let k = value / step;
+    let next = if dir > 0.0 { (k + 1e-3).floor() + 1.0 } else { (k - 1e-3).ceil() - 1.0 };
+    (next * step * 1000.0).round() / 1000.0
+}
+
+/// A dimension's value for a row: no trailing zeros.
+fn fmt_dim(v: f32) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// A round grid spacing (1, 2 or 5 times a power of ten) near x.
@@ -747,6 +766,7 @@ enum Overlay {
     Keys,
     Models,
     Requests,
+    Dims,
     Reply,
 }
 
@@ -801,7 +821,7 @@ fn overlay_rows(ov: Overlay, models: usize) -> usize {
     match ov {
         Overlay::Off => 0,
         Overlay::Keys => KEY_HELP.len(),
-        Overlay::Models | Overlay::Requests => models.clamp(1, MODELS_SHOWN),
+        Overlay::Models | Overlay::Requests | Overlay::Dims => models.clamp(1, MODELS_SHOWN),
         Overlay::Reply => REPLY_ROWS,
     }
 }
@@ -936,6 +956,12 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Keep (save) the last request to repeat"
             }
         }
+        Button::Dims => match (overlay == Overlay::Dims, short) {
+            (true, true) => "Close",
+            (false, true) => "Dims",
+            (true, false) => "Close the dimensions",
+            (false, false) => "Dimensions: change a size directly (no AI)",
+        },
         Button::Saved => match (overlay == Overlay::Requests, short) {
             (true, true) => "Close",
             (false, true) => "Saved",
@@ -1126,6 +1152,7 @@ fn active(b: Button, st: &PanelState) -> bool {
         Button::Models => st.overlay == Overlay::Models,
         Button::Keys => st.overlay == Overlay::Keys,
         Button::Saved => st.overlay == Overlay::Requests,
+        Button::Dims => st.overlay == Overlay::Dims,
         Button::Reply => st.overlay == Overlay::Reply,
         Button::Keyboard => st.kb_open,
         Button::Section => st.section == Section::Moving,
@@ -1268,7 +1295,12 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
     if overlay != Overlay::Off {
         let models = voice::MODELS.lock().ok().and_then(|m| m.clone());
         let requests = voice::REQUESTS.lock().ok().and_then(|m| m.clone());
-        let count = if overlay == Overlay::Requests { requests.as_ref().map_or(0, |m| m.len()) } else { models.as_ref().map_or(0, |m| m.len()) };
+        let dims = voice::DIMS.lock().ok().and_then(|m| m.clone());
+        let count = match overlay {
+            Overlay::Requests => requests.as_ref().map_or(0, |m| m.len()),
+            Overlay::Dims => dims.as_ref().map_or(0, |m| m.len()),
+            _ => models.as_ref().map_or(0, |m| m.len()),
+        };
         let rows = overlay_rows(overlay, count);
         let (y0, h) = (hh + OV_GAP, overlay_h(overlay, rows));
         ui.quad(-hw, y0, hw, y0 + h, 0.0, [28, 34, 46]);
@@ -1279,6 +1311,7 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
         let title = match overlay {
             Overlay::Keys => "Keyboard and mouse".to_string(),
             Overlay::Requests => "Saved requests (click to run, x removes)".to_string(),
+            Overlay::Dims => "Dimensions (click - or + to change, no AI)".to_string(),
             Overlay::Reply => format!("Reply, page {}/{} (click: next page, Esc: close)", page + 1, pages),
             _ => "Open a model on the Mac (trigger / click)".to_string(),
         };
@@ -1329,6 +1362,28 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
                 }
                 }
             }
+            Overlay::Dims => match &dims {
+                None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) if list.is_empty() => ui.text("Nothing to set: the design has no parameters or features", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) => {
+                    for (i, d) in list.iter().take(MODELS_SHOWN).enumerate() {
+                        let y = row_top(i);
+                        if overlay_hover == Some(i) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        // The two targets at the right end: one step down, one step up.
+                        ui.quad(hw - DIM_ZONE * 2.0, y - OV_PICK_HIT, hw - DIM_ZONE - 0.002, y + 0.0005, 0.0006, [60, 72, 92]);
+                        ui.quad(hw - DIM_ZONE, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0006, [60, 72, 92]);
+                        ui.text_px("-", hw - DIM_ZONE * 1.5 - 0.003, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        ui.text_px("+", hw - DIM_ZONE * 0.5 - 0.004, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        let value = format!("{} {}", fmt_dim(d.value), d.unit);
+                        let vw = Ui::text_width_px(&value, OV_PICK_FP);
+                        let right = hw - DIM_ZONE * 2.0 - 0.006;
+                        ui.text_px(&Ui::fit(&d.label, (right + hw - 0.02 - vw) * FONT_PX / OV_PICK_FP), -hw + 0.01, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        ui.text_px(&value, right - vw, y - 0.001, 0.001, [140, 240, 150], OV_PICK_FP);
+                    }
+                }
+            },
             _ => match &models {
                 None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
                 Some(list) if list.is_empty() => ui.text("No models found on the Mac", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
@@ -3211,8 +3266,11 @@ fn run(app: &Host) {
             let mut overlay_hover: Option<usize> = None;
             let mut overlay_del = false;
             let mut overlay_click = false;
+            let mut overlay_x = 0.0f32;
             let n_models = if overlay == Overlay::Requests {
                 voice::REQUESTS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
+            } else if overlay == Overlay::Dims {
+                voice::DIMS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             } else {
                 voice::MODELS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             };
@@ -3306,8 +3364,9 @@ fn run(app: &Host) {
                                     on_panel = true;
                                     overlay_click = true;
                                     len = t;
-                                    if matches!(overlay, Overlay::Models | Overlay::Requests) && n_models > 0 {
+                                    if matches!(overlay, Overlay::Models | Overlay::Requests | Overlay::Dims) && n_models > 0 {
                                         overlay_hover = overlay_row_at(overlay, y, ov_rows, lay.h);
+                                        overlay_x = x;
                                         overlay_del = overlay == Overlay::Requests && x > PANEL_W / 2.0 - 0.025;
                                     }
                                 }
@@ -3491,6 +3550,7 @@ fn run(app: &Host) {
                         K::T => Some(Button::Repeat),
                         K::W => Some(Button::SaveReq),
                         K::Q => Some(Button::Saved),
+                        K::V => Some(Button::Dims),
                         _ => key_btn,
                     };
                     continue;
@@ -3617,6 +3677,18 @@ fn run(app: &Host) {
                                 overlay = Overlay::Off;
                             }
                         }
+                    } else if let (Some(i), Overlay::Dims) = (model_pick, overlay) {
+                        // A dimension: the - and + at the right end change it by one step, on the Mac, with no AI.
+                        let d = voice::DIMS.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(i).cloned()));
+                        if let Some(d) = d {
+                            let side = PANEL_W / 2.0 - overlay_x;
+                            let dir = if side < DIM_ZONE { 1.0 } else if side < DIM_ZONE * 2.0 { -1.0 } else { 0.0 };
+                            if dir != 0.0 {
+                                let value = dim_step_to(d.value, dir);
+                                log::info!("dimension {} ({}): {} -> {}", d.label, d.id, d.value, value);
+                                voice::set_dim(&d.id, value);
+                            }
+                        }
                     } else if let Some(i) = model_pick {
                         let m = voice::MODELS.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(i).cloned()));
                         if let Some(m) = m {
@@ -3687,6 +3759,15 @@ fn run(app: &Host) {
                             Button::ConfirmStop => voice::cancel_confirm(),
                             Button::Repeat => voice::repeat_last(),
                             Button::SaveReq => voice::save_last(),
+                            Button::Dims => {
+                                overlay = if overlay == Overlay::Dims { Overlay::Off } else { Overlay::Dims };
+                                if overlay == Overlay::Dims {
+                                    if let Ok(mut d) = voice::DIMS.lock() {
+                                        *d = None;
+                                    }
+                                    voice::fetch_dims();
+                                }
+                            }
                             Button::Saved => {
                                 overlay = if overlay == Overlay::Requests { Overlay::Off } else { Overlay::Requests };
                                 if overlay == Overlay::Requests {
@@ -4676,5 +4757,29 @@ fn run(app: &Host) {
         vk_device.destroy_render_pass(render_pass, None);
         vk_device.destroy_device(None);
         vk_instance.destroy_instance(None);
+    }
+}
+
+#[cfg(test)]
+mod dim_tests {
+    use super::{dim_step_to, fmt_dim};
+
+    #[test]
+    fn a_dimension_steps_by_a_round_tenth_and_lands_on_multiples() {
+        assert_eq!(dim_step_to(60.0, 1.0), 65.0);
+        assert_eq!(dim_step_to(60.0, -1.0), 55.0);
+        assert_eq!(dim_step_to(10.0, 1.0), 11.0);
+        assert_eq!(dim_step_to(6.0, -1.0), 5.5);
+        // A value between steps goes to the next multiple, not past it.
+        assert_eq!(dim_step_to(62.0, 1.0), 65.0);
+        assert_eq!(dim_step_to(62.0, -1.0), 60.0);
+        assert_eq!(dim_step_to(0.3, 1.0), 0.32);
+    }
+
+    #[test]
+    fn a_value_is_shown_without_trailing_zeros() {
+        assert_eq!(fmt_dim(60.0), "60");
+        assert_eq!(fmt_dim(5.5), "5.5");
+        assert_eq!(fmt_dim(0.125), "0.125");
     }
 }

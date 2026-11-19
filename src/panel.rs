@@ -43,7 +43,7 @@ impl Tab {
         match self {
             Tab::Select => &[Button::Faces, Button::Hide, Button::Isolate, Button::ShowAll],
             Tab::View => &[Button::Room, Button::Edges, Button::Explode, Button::Guides, Button::Recentre],
-            Tab::Tools => &[Button::Section, Button::Measure, Button::PushPull, Button::Place, Button::Size],
+            Tab::Tools => &[Button::Section, Button::Measure, Button::PushPull, Button::Place, Button::Size, Button::Dims],
             Tab::Notes => &[Button::Note, Button::DoNotes, Button::DeleteNote, Button::Repeat, Button::SaveReq, Button::Saved],
             Tab::More => &[Button::Models, Button::Keys, Button::Keyboard, Button::SaveFile, Button::Snap],
         }
@@ -142,6 +142,7 @@ pub fn icon_of(b: Button) -> &'static Icon {
         Button::Repeat => &icons::REPEAT,
         Button::SaveReq => &icons::SAVE,
         Button::Saved => &icons::LIST,
+        Button::Dims => &icons::LIST,
         Button::ConfirmGo => &icons::CHECK,
         Button::ConfirmStop => &icons::CLEAR,
         Button::CancelVoice => &icons::CLEAR,
@@ -181,6 +182,7 @@ pub fn shortcut(b: Button) -> &'static str {
         Button::Repeat => "Ctrl+T",
         Button::SaveReq => "Ctrl+W",
         Button::Saved => "Ctrl+Q",
+        Button::Dims => "Ctrl+V",
         Button::ConfirmGo => "Enter or B",
         Button::ConfirmStop => "Esc",
         Button::CancelVoice => "Esc, or say cancel",
