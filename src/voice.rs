@@ -98,6 +98,10 @@ pub fn parse_comments(text: &str) -> Vec<Comment> {
 
 /// Push/pull: moves a face ("body\tx\ty\tz", a point on it) by `mm` (positive = outward) on the Mac.
 pub fn push_pull(face: String, mm: f32) {
+    if !mm.is_finite() {
+        set_status("", None, Some("That pull gave no usable distance; try again."));
+        return;
+    }
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -740,6 +744,11 @@ pub fn set_dims_of(feature: &str) {
 /// Moves a part on the Mac (POST /move, no AI). `onto`: the point it was taken hold of and the point on
 /// another part it was let go over, when it should be set on that face; else it moves by `by` (model units).
 pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3], [f32; 3])>) {
+    let finite = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+    if !(finite(&by) && onto.as_ref().is_none_or(|(a, b, n)| finite(a) && finite(b) && finite(n))) {
+        set_status("", None, Some("That move gave no usable position; try again."));
+        return;
+    }
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -933,6 +942,10 @@ pub fn fetch_dims() {
 
 /// Sets one dimension on the Mac (POST /dimension, no AI); the beacon's new version brings the changed model.
 pub fn set_dim(id: &str, value: f32) {
+    if !value.is_finite() {
+        say("That drag gave no usable value; try again.");
+        return;
+    }
     let id = id.to_string();
     std::thread::spawn(move || {
         let r = post_typed("/dimension", b"", "text/plain", 30, &format!("X-Name: {}\r\nX-Value: {}\r\n", percent(&id), value));

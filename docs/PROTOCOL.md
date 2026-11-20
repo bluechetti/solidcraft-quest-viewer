@@ -78,6 +78,13 @@ All are `POST`. Every reply is JSON with at least:
 
 `changed: true` means the model changed; the new mesh is announced by the beacon's model version.
 
+Requests that touch the design are handled one at a time, in the order they arrive (except `/transcribe`).
+One that waits more than 20 s behind another (an AI change can take a minute) is answered at once with
+`"busy": true`, `ok: false` and a reply asking to try again. Numbers must be finite: `nan` or `inf` is
+refused with `ok: false` and the design is not touched. Any request that fails still gets a JSON reply,
+never a dropped connection. If SolidCraft itself stops (a crash), the server starts it again with the design
+reopened from its file. Changes that were not saved are then lost, and the reply says so.
+
 | Request | Headers and body | Notes |
 |---|---|---|
 | `/ask` | Body: a WAV recording (16 kHz mono), or text with `Content-Type: text/plain`. Optional `X-Selected`, `X-Point`, `X-Faces`, `X-Edges`, `X-Replay` (section 5). | The main request. Reply adds `cost` (dollars, as text) and, when a big request waits for an OK, `confirm_k` and `confirm_cost`. |

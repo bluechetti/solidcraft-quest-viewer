@@ -63,6 +63,7 @@ AI = {"backend": "anthropic", "url": "http://localhost:11434/v1", "model": "qwen
 STARTED = int(time.time())
 state = {"data": None, "version": None, "name": None, "counter": 0, "source": None, "notes": [], "notes_version": 0}
 lock = threading.Lock()
+edit_lock = threading.RLock()  # held by each request that reads or changes the design (see Handler.do_POST)
 args = None
 session = None  # the headless SolidCraft session (Mcp), when the source is a design
 work = tempfile.mkdtemp(prefix="scview-")
@@ -79,41 +80,146 @@ def log(msg):
         pass
 
 
+def num(text):
+    """A number from the headset: finite, else ValueError (nan or inf would break the model or the session)."""
+    v = float(text)
+    if not math.isfinite(v):
+        raise ValueError(f"{str(text).strip()!r} is not a usable number")
+    return v
+
+
+def length(headers):
+    """The request's Content-Length (0 when absent or not a number)."""
+    try:
+        return max(0, int(headers.get("Content-Length", 0)))
+    except ValueError:
+        return 0
+
+
 # --- headless SolidCraft session over MCP (JSON-RPC on stdio) ---
 
 class Mcp:
+    """The headless SolidCraft session. A call that gets no answer in time, or a session that has ended (a crash),
+    starts a new one with the design reopened from its file: the headset's unsaved changes are then gone, and
+    the reply says so, but the server keeps working."""
+    TIMEOUT = 600      # seconds for one call (a sweep or a big export can take minutes)
+    OPEN_TIMEOUT = 3600  # opening a large STEP file
+
     def __init__(self, cli):
-        self.p = subprocess.Popen([cli, "mcp", "--headless", "--allow-any-path", "--compact"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.cli = cli
         self.n = 0
-        self.lock = threading.Lock()
-        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                "clientInfo": {"name": "scview", "version": "1"}})
+        self.lock = threading.RLock()
+        self.restarts = 0
+        self._start()
+
+    def _start(self):
+        import queue
+        self.p = subprocess.Popen([self.cli, "mcp", "--headless", "--allow-any-path", "--compact"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.q = queue.Queue()
+        threading.Thread(target=self._read, args=(self.p, self.q), daemon=True).start()
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "scview", "version": "1"}})
         self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) + "\n")
         self.p.stdin.flush()
-        self.tools = {t["name"]: t for t in self.rpc("tools/list")["tools"]}
+        self.tools = {t["name"]: t for t in self._rpc("tools/list")["tools"]}
+
+    @staticmethod
+    def _read(p, q):
+        for line in p.stdout:
+            q.put(line)
+        q.put(None)  # the session ended
+
+    def _stop(self):
+        try:
+            self.p.kill()
+            self.p.wait(10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _restart(self, why):
+        """A new session with the design reopened from its file (the caller holds the lock)."""
+        log(f"SolidCraft session: {why}; starting a new one")
+        self._stop()
+        self.restarts += 1
+        self._start()
+        on_session_restart(self)
 
     def rpc(self, method, params=None):
+        # A number that is not finite is not JSON: SolidCraft would answer a parse error with no id and the
+        # request would wait for ever. Refused here, as a bad value.
+        line = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}}, allow_nan=False)
         with self.lock:
-            self.n += 1
-            msg = {"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}}
-            self.p.stdin.write(json.dumps(msg) + "\n")
+            if self.p.poll() is not None:
+                self._restart(f"it had stopped (exit {self.p.returncode})")
+            try:
+                return self._rpc(method, params, line)
+            except _SessionLost as e:
+                self._restart(str(e))
+                raise RuntimeError(f"SolidCraft {e}; it was started again with the design from its file, so changes "
+                                   f"not saved are gone. Try that again.")
+
+    def _rpc(self, method, params=None, line=None):
+        import queue
+        self.n += 1
+        n = self.n
+        line = line or json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}}, allow_nan=False)
+        try:
+            self.p.stdin.write('{"id": %d, ' % n + line[1:] + "\n")
             self.p.stdin.flush()
-            while True:
-                line = self.p.stdout.readline()
-                if not line:
-                    raise RuntimeError("the SolidCraft session ended")
-                r = json.loads(line)
-                if r.get("id") == self.n:
-                    if "error" in r:
-                        raise RuntimeError(r["error"].get("message", str(r["error"])))
-                    return r["result"]
+        except (BrokenPipeError, OSError, ValueError):
+            raise _SessionLost("stopped")
+        timeout = self.OPEN_TIMEOUT if (params or {}).get("name") == "open" else self.TIMEOUT
+        end = time.time() + timeout
+        while True:
+            try:
+                out = self.q.get(timeout=max(0.1, end - time.time()))
+            except queue.Empty:
+                raise _SessionLost(f"gave no answer in {timeout} s")
+            if out is None:
+                raise _SessionLost("stopped")
+            try:
+                r = json.loads(out)
+            except ValueError:
+                continue  # not a reply (stray output)
+            if r.get("id") == n:
+                if "error" in r:
+                    raise RuntimeError(r["error"].get("message", str(r["error"])))
+                return r["result"]
+            if r.get("id") is None and "error" in r:
+                # The request itself was not understood: no reply with our id will come.
+                raise RuntimeError(r["error"].get("message", str(r["error"])))
 
     def call(self, name, arguments):
         """A tool call: (text, is_error)."""
         r = self.rpc("tools/call", {"name": name, "arguments": arguments})
         text = "\n".join(c.get("text", "") for c in r.get("content", []) if c.get("type") == "text")
         return text, bool(r.get("isError"))
+
+
+class _SessionLost(RuntimeError):
+    pass
+
+
+def on_session_restart(s):
+    """A new SolidCraft session: open the design again, forget undo steps that belonged to the old one, show it."""
+    ai_undo.clear()
+    ai_redo.clear()
+    waiting["p"] = None
+    pending["st"] = None
+    explode["view"] = None
+    clashes.clear()
+    src = state.get("source")
+    if not src:
+        return
+    try:
+        text, err = s.call("open", {"path": src})
+        if err:
+            log(f"SolidCraft session: reopening {src} failed: {text[:200]}")
+            return
+        export_scm()
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as e:
+        log(f"SolidCraft session: reopening {src} failed: {e}")
 
 
 def export_bytes():
@@ -993,7 +1099,7 @@ def set_joint(dim, value):
     """Drive a joint to a value (deg or mm): (reply, changed). One undo step. SolidCraft holds it at a limit."""
     assembled()
     before = undo_depth()
-    text, err = session.call("execute", {"command": "joint.drive", "params": {"joint": dim["joint"], "value": float(value), "quiet": True}})
+    text, err = session.call("execute", {"command": "joint.drive", "params": {"joint": dim["joint"], "value": num(value), "quiet": True}})
     log(f"joint: {dim['label']} = {value!r} -> {'ERROR ' if err else ''}{text[:200]}")
     if err:
         return f"SolidCraft could not move {dim['feature']}: {text[:120]}", False
@@ -1182,12 +1288,23 @@ UNITS = {"mm": "", "millimeter": "", "millimetre": "", "cm": " cm", "centimeter"
          "inch": " in", "inche": " in", "deg": " deg", "degree": " deg"}
 
 
+SIZE_INPUTS = re.compile(r"(length|width|height|depth|thickness|radius|diameter|size)$", re.I)
+
+
+def is_size(dim):
+    """A size (a box's length, a cylinder's radius, a hole's diameter, a parameter called "thickness"): it must
+    stay above 0."""
+    if dim.get("kind") == "feature":
+        return bool(SIZE_INPUTS.search(str(dim.get("input") or "")))
+    return dim.get("kind") == "user" and bool(SIZE_INPUTS.search(str(dim.get("id") or "")))
+
+
 def set_dimension(dim, value, why=""):
     """Set one dimension (a number in its own unit, or an expression). (reply, changed). A value that breaks
     a feature is taken back."""
     if dim.get("kind") == "joint":
         try:
-            return set_joint(dim, float(value))
+            return set_joint(dim, num(value))
         except (TypeError, ValueError):
             return f"{dim['label']} needs a number.", False
     assembled()
@@ -1197,10 +1314,15 @@ def set_dimension(dim, value, why=""):
     if err:
         return f"SolidCraft refused {dim['label']} = {value}: {text[:120]}", False
     r = json.loads(text)
+    shown = f"{value:g}" if isinstance(value, float) else value
     if r.get("errors"):
         session.call("undo", {})
-        shown = f"{value:g}" if isinstance(value, float) else value
         return f"{dim['label']} = {shown} breaks {len(r['errors'])} feature(s), so I put it back.", False
+    now = r.get("display_value", value)
+    if is_size(dim) and isinstance(now, (int, float)) and now <= 0:
+        # SolidCraft takes a negative length as the other direction: the part turns inside out. Not for a size.
+        session.call("undo", {})
+        return f"{dim['label']} has to be more than 0 (asked for {shown}), so I put it back.", False
     ai_redo.clear()
     if before is not None:
         ai_undo.append((before, f"{dim['label']} = {value:g}" if isinstance(value, float) else f"{dim['label']} = {value}"))
@@ -1325,6 +1447,8 @@ def move_body(body, translate=None, frm=None, to=None, normal=None):
         label = f"set {body} on another part"
         reply = f"{body} set there ({how})."
     else:
+        if not translate:
+            return "No move given: send how far (X-Translate), or where to set the part (X-From and X-To).", False
         t = [round(float(x), 4) for x in translate]
         text, err = session.call("execute", {"command": "solid.move", "params": {"bodies": [body], "translate": t}})
         label = f"move {body} by {t}"
@@ -1708,6 +1832,7 @@ def transcribe(wav, name="ask.wav"):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+    timeout = 60  # a headset that stops sending mid-request (asleep, out of Wi-Fi) does not hold a thread for ever
 
     def authorised(self):
         """True when the request carries the access code; else a 403 is sent (a JSON answer for the headset to show)."""
@@ -1724,6 +1849,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
+        try:
+            self._get()
+        except Exception as e:  # SolidCraft busy restarting or refusing: answer, do not drop the connection
+            log(f"GET {self.path}: {type(e).__name__}: {e}")
+            try:
+                self.send_error(503, str(e)[:200])
+            except OSError:
+                pass
+
+    def _get(self):
         if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt", "/history.txt", "/explodes.txt", "/features.txt", "/handles.txt", "/clashes.txt"):
             out = {"/handles.txt": handles_text, "/clashes.txt": clashes_text, "/features.txt": features_text, "/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
                    "/dimensions.txt": dimensions_text, "/history.txt": history_text_lines, "/explodes.txt": explodes_text}[self.path]()
@@ -1756,6 +1891,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorised():
             return
+        try:  # the body first, before waiting for the design: a slow upload must not hold up other requests
+            self._body = self.rfile.read(min(length(self.headers), 20_000_000))
+        except OSError as e:
+            log(f"POST {self.path}: the request did not arrive whole ({e})")
+            return
+        if len(self._body) < min(length(self.headers), 20_000_000):
+            # The sender stopped part way (connection lost): a cut-off recording or half a sentence is not acted on.
+            log(f"POST {self.path}: only {len(self._body)} of {length(self.headers)} bytes arrived; dropped")
+            return
+        if self.path == "/transcribe":  # no design involved, and it may take a while: not queued behind edits
+            return self._post()
+        # One request at a time touches the design: two at once would mix their undo steps, a change could land
+        # inside an AI preview's checkpoint and be thrown away with it, or two exports could overwrite each other.
+        # The viewer gives up on a panel request after 30 s: answer before that when another request (an AI
+        # change can take a minute) still has the design.
+        if not edit_lock.acquire(timeout=20):
+            log(f"POST {self.path}: busy")
+            self.reply_json({"heard": "", "reply": "Still busy with the last request: try again when it is done.",
+                             "ok": False, "changed": False, "busy": True})
+            return
+        try:
+            return self._post()
+        except Exception as e:  # never drop the connection: the headset shows the reply
+            log(f"POST {self.path}: {type(e).__name__}: {e}")
+            try:
+                self.reply_json({"heard": "", "reply": f"That failed: {e}", "ok": False, "changed": False})
+            except OSError:
+                pass
+        finally:
+            edit_lock.release()
+
+    def _post(self):
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
                              "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension",
                              "/preview/apply", "/preview/cancel", "/visibility", "/explode", "/feature", "/move", "/interference", "/sweep"):
@@ -1779,7 +1946,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Move a note (X-Pin) and/or set its text (a text/plain body); it then counts as not done.
             note_id = urllib.parse.unquote(self.headers.get("X-Id", ""))
             pin = urllib.parse.unquote(self.headers.get("X-Pin", ""))
-            text = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 100_000)).decode("utf-8", "replace").strip()
+            text = self._body[:100_000].decode("utf-8", "replace").strip()
             reply, ok = "Note not found.", False
             try:
                 with lock:
@@ -1787,7 +1954,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if note is not None:
                         if pin:
                             body_name, x, y, z = pin.split("\t")
-                            note["body"], note["point"] = body_name, [float(x), float(y), float(z)]
+                            note["body"], note["point"] = body_name, [num(x), num(y), num(z)]
                         if text:
                             note["text"] = text
                         note["done"] = False
@@ -1828,8 +1995,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if session is None:
                     raise RuntimeError("Push/pull needs a STEP or .sc source (this one is view only).")
                 f = urllib.parse.unquote(self.headers.get("X-Face", "")).split("\t")
-                point = [float(v) for v in f[1:4]]
-                dist = float(self.headers.get("X-Distance", "0"))
+                point = [num(v) for v in f[1:4]]
+                if len(point) != 3:
+                    raise ValueError("the face needs a body and a point")
+                dist = num(self.headers.get("X-Distance", "0"))
                 if not dist:
                     raise RuntimeError("No distance.")
                 assembled()
@@ -1874,7 +2043,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     value = float(raw)
                 except ValueError:
-                    value = raw
+                    value = raw  # an expression, which SolidCraft checks
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise RuntimeError(f"{dim['label']} needs a real number, not {raw}.")
                 reply, changed = set_dimension(dim, value, " (panel)")
                 if changed:
                     export_scm()
@@ -1893,7 +2064,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log(f"{self.path[1:]}: {reply}")
             self.reply_json({"heard": "", "reply": reply, "ok": True, "changed": False})
             return
-        body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 20_000_000))
+        body = self._body
         if self.path == "/interference":
             # Which parts overlap, as the design stands. The reply's "select" names the bodies involved (the
             # headset selects them, so Isolate shows only those); /clashes.txt has the pairs.
@@ -1936,7 +2107,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 if session is None:
                     raise RuntimeError("Moving parts needs a STEP or .sc source.")
-                vec = lambda name: [float(v) for v in urllib.parse.unquote(self.headers.get(name, "")).split("\t")] if self.headers.get(name) else None
+                def vec(name):
+                    if not self.headers.get(name):
+                        return None
+                    v = [num(x) for x in urllib.parse.unquote(self.headers[name]).split("\t")]
+                    if len(v) != 3:
+                        raise ValueError(f"{name} needs three numbers")
+                    return v
                 body = urllib.parse.unquote(self.headers.get("X-Body", ""))
                 reply, changed = move_body(body, vec("X-Translate"), vec("X-From"), vec("X-To"), vec("X-Normal"))
                 if changed:
@@ -2095,7 +2272,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     log(f"note re-recorded: {heard!r}")
                     return
                 body_name, x, y, z = urllib.parse.unquote(self.headers.get("X-Pin", "")).split("\t")
-                point = [float(x), float(y), float(z)]
+                point = [num(x), num(y), num(z)]
                 note_id = uuid.uuid4().hex[:8]
                 with lock:
                     state["notes"].append({"id": note_id, "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "body": body_name,
@@ -2122,8 +2299,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if self.headers.get("X-Point"):
                 f = urllib.parse.unquote(self.headers["X-Point"]).split("\t")
-                pt = tuple(float(v) for v in f[1:4])
-                face = resolve_face(f[0], pt, [float(v) for v in f[4:7]]) if len(f) >= 7 and session else None
+                pt = tuple(num(v) for v in f[1:4])
+                face = resolve_face(f[0], pt, [num(v) for v in f[4:7]]) if len(f) >= 7 and session else None
                 pointed = (f[0], pt, face)
         except (ValueError, RuntimeError):
             pointed = None
@@ -2133,10 +2310,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for line in urllib.parse.unquote(self.headers.get("X-Faces", "")).split("\n")[:50]:
                 f = line.split("\t")
                 if len(f) == 7 and session:
-                    item = resolve_face_item(f[0], [float(v) for v in f[1:4]], [float(v) for v in f[4:7]])
+                    item = resolve_face_item(f[0], [num(v) for v in f[1:4]], [num(v) for v in f[4:7]])
                     if item is not None:
                         face_items.append({"type": "face", "body": f[0], "index": item["index"]})
-                    d = resolve_face(f[0], [float(v) for v in f[1:4]], [float(v) for v in f[4:7]])
+                    d = resolve_face(f[0], [num(v) for v in f[1:4]], [num(v) for v in f[4:7]])
                     faces.append(d or f"a face of \"{f[0]}\" through the point {[round(float(v), 3) for v in f[1:4]]} (not matched exactly)")
         except (ValueError, RuntimeError):
             faces = []
@@ -2146,7 +2323,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for line in urllib.parse.unquote(self.headers.get("X-Edges", "")).split("\n")[:50]:
                 f = line.split("\t")
                 if len(f) == 11 and session:
-                    v = [float(x) for x in f[1:]]
+                    v = [num(x) for x in f[1:]]
                     d = resolve_edge(f[0], v[0:3], v[3:6], v[6:9], v[9])
                     edges.append(d or f"an edge of \"{f[0]}\" from {[round(x, 3) for x in v[0:3]]} to {[round(x, 3) for x in v[6:9]]} (not matched exactly)")
         except (ValueError, RuntimeError):
@@ -2440,11 +2617,14 @@ def load(src):
         state["opened"] = state.get("opened", 0) + 1
         state["model"] = f"{STARTED:x}.{state['opened']}"
     ext = os.path.splitext(src)[1].lower()
-    # A different model: the AI's undo and redo steps belonged to the last one.
+    # Opened again (another model, or this one changed on disk): the undo and redo steps, a change on show and
+    # the overlap marks all belonged to the design as it was.
+    ai_undo.clear()
+    ai_redo.clear()
     if state["source"] != os.path.abspath(src):
-        ai_undo.clear()
-        ai_redo.clear()
         recent.clear()
+    waiting["p"] = None
+    clashes.clear()
     if ext in (".step", ".stp", ".sc") and not args.no_ai:
         if session is None:
             session = Mcp(args.cli)
@@ -2567,9 +2747,10 @@ def main():
                 time.sleep(0.5)  # let a save or export finish writing
                 log(f"loading {os.path.basename(src)} ...")
                 try:
-                    load(src)
-                except (subprocess.CalledProcessError, OSError, RuntimeError) as e:
-                    log(f"  loading failed: {e}")
+                    with edit_lock:  # not in the middle of an edit from the headset
+                        load(src)
+                except Exception as e:  # a broken or half-written file: keep serving the last good model
+                    log(f"  loading failed: {type(e).__name__}: {e}")
         time.sleep(1)
 
 
